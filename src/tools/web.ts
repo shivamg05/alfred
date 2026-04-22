@@ -23,24 +23,25 @@ export async function searchWeb(query: string): Promise<string> {
 
   if (!res.ok) throw new Error(`Firecrawl search failed: ${res.status}`);
 
-  const data = (await res.json()) as {
-    success: boolean;
-    data?: Array<{
-      url: string;
-      title?: string;
-      description?: string;
-      markdown?: string;
-    }>;
-  };
+  const body = await res.json() as Record<string, unknown>;
+  console.log(`[tools/web] search response keys: ${Object.keys(body).join(", ")}`);
 
-  if (!data.success || !data.data?.length) return "No results found.";
+  // Firecrawl v2 search returns { success, data: [...] }
+  const results = (body.data ?? body.results ?? []) as Array<{
+    url: string;
+    title?: string;
+    description?: string;
+    markdown?: string;
+  }>;
 
-  return data.data
+  if (!results.length) return "No results found.";
+
+  return results
     .slice(0, 5)
     .map((r) => {
       const header = `**${r.title ?? r.url}**\n${r.url}`;
-      const body = r.markdown?.slice(0, 600) ?? r.description ?? "";
-      return `${header}\n${body}`;
+      const content = r.markdown?.slice(0, 600) ?? r.description ?? "";
+      return `${header}\n${content}`;
     })
     .join("\n\n---\n\n");
 }

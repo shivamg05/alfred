@@ -2,15 +2,26 @@ import { ChromaClient, Collection, EmbeddingFunction } from "chromadb";
 import OpenAI from "openai";
 import { config } from "../config.js";
 
-// Use OpenAI embeddings directly so ChromaDB doesn't try to load its default embed package
+// Use OpenAI embeddings directly so ChromaDB doesn't try to load its default embed package.
+// If LLM_BASE_URL is set (e.g. OpenRouter), route embeddings through it too — the key is
+// an OpenRouter key and won't work against api.openai.com directly.
+// OpenRouter supports text-embedding-3-small at openai/text-embedding-3-small.
 class OpenAIEmbeddings implements EmbeddingFunction {
-  private client = new OpenAI({ apiKey: config().OPENAI_API_KEY });
+  private client: OpenAI;
+
+  constructor() {
+    const cfg = config();
+    this.client = new OpenAI({
+      apiKey: cfg.OPENAI_API_KEY,
+      ...(cfg.LLM_BASE_URL ? { baseURL: cfg.LLM_BASE_URL } : {}),
+    });
+  }
 
   async generate(texts: string[]): Promise<number[][]> {
-    const response = await this.client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: texts,
-    });
+    const cfg = config();
+    // OpenRouter uses namespaced model IDs; OpenAI uses bare names.
+    const model = cfg.LLM_BASE_URL ? "openai/text-embedding-3-small" : "text-embedding-3-small";
+    const response = await this.client.embeddings.create({ model, input: texts });
     return response.data.map((d) => d.embedding);
   }
 }

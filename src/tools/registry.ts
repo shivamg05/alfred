@@ -144,11 +144,14 @@ export async function executeTool(
   args: Record<string, string>,
 ): Promise<string> {
   console.log(`[tools] ${name}(${JSON.stringify(args)})`);
+  let result: string;
   if (name === "search_web" || name === "scrape_url") {
-    return executeWebTool(name, args);
+    result = await executeWebTool(name, args);
+  } else if (name.startsWith("todoist_")) {
+    result = await executeTodoistTool(name, args);
+  } else {
+    result = `Unknown tool: ${name}`;
   }
-  if (name.startsWith("todoist_")) {
-    return executeTodoistTool(name, args);
-  }
-  return `Unknown tool: ${name}`;
+  console.log(`[tools] ${name} result: ${result.slice(0, 300)}${result.length > 300 ? "…" : ""}`);
+  return result;
 }
