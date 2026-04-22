@@ -2,8 +2,7 @@ import {
   getFactById,
   getMessageById,
   getActiveDynamicFacts,
-  getStaticProfileFacts,
-  getDynamicProfileFacts,
+  getActiveStaticFacts,
   searchFactsFTS,
 } from "./facts.js";
 import { querySimilarFacts } from "./vectors.js";
@@ -57,8 +56,9 @@ function formatWithSourceChunk(factText: string, sourceMessageId?: number): stri
 }
 
 export async function retrieveContext(queryText: string): Promise<RetrievedContext> {
-  const staticProfile = getStaticProfileFacts();
-  const dynamicProfile = getDynamicProfileFacts();
+  // Pull directly from memory_facts (is_latest=1 filter) so superseded facts never surface
+  const staticProfile = getActiveStaticFacts().slice(0, 15).map((f) => f.text);
+  const dynamicProfile = getActiveDynamicFacts().slice(0, 10).map((f) => f.text);
 
   let relevantFacts: string[] = [];
 
@@ -97,12 +97,18 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
 
     candidates.sort((a, b) => b.finalScore - a.finalScore);
 
-    relevantFacts = candidates.slice(0, 6).map(({ fact }) =>
-      formatWithSourceChunk(fact.text, fact.source_message_id),
-    );
+    // Exclude facts already shown in the profile sections to avoid duplication
+    const profileSet = new Set([...staticProfile, ...dynamicProfile]);
+    relevantFacts = candidates
+      .filter(({ fact }) => !profileSet.has(fact.text))
+      .slice(0, 6)
+      .map(({ fact }) => formatWithSourceChunk(fact.text, fact.source_message_id));
   } else {
-    // Nothing in ChromaDB or FTS — fall back to recent dynamic facts
-    const fallback = getActiveDynamicFacts().slice(0, 6);
+    // Nothing in ChromaDB or FTS — fall back to recent dynamic facts not in profile
+    const profileSet = new Set([...staticProfile, ...dynamicProfile]);
+    const fallback = getActiveDynamicFacts()
+      .filter((f) => !profileSet.has(f.text))
+      .slice(0, 6);
     relevantFacts = fallback.map((f) =>
       formatWithSourceChunk(f.text, f.source_message_id),
     );

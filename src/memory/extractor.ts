@@ -156,7 +156,8 @@ FACTS — each fact MUST be a JSON object, not a string:
 
 5. UPDATES (corrects/supersedes a prior fact — is_static: depends)
    "I changed my mind", "actually I'm doing Y instead of X now"
-   contradicts_hint: short phrase describing the old fact being replaced
+   contradicts_hint: short phrase from the OLD fact being replaced
+   IMPORTANT: set contradicts_hint on the NEW fact only. Do NOT create a separate fact about what the user "previously said" or "used to think".
 
 ═══════════════════════
 EXTRACTION RULES:
@@ -169,6 +170,7 @@ EXTRACTION RULES:
 - is_static: true for stable identity/preferences, false for current situations/events
 - forget_after: set for temporary facts. event_date + 8 weeks, or today + 3 weeks for vague ongoing states
 - Lean toward extraction. A slightly redundant fact is fine. A missed fact is bad.
+- DO NOT extract meta/conversational noise: "User is discussing X", "User is asking about Y", "User is wondering about Z", "User joked that...", "User is asking for advice on..." — these add no lasting memory value. Only extract facts about their actual life, opinions, plans, or identity.
 
 ═══════════════════════
 REMINDERS — only explicit asks:

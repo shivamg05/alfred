@@ -53,6 +53,8 @@ export function updateChromaId(factId: number, chromaId: string): void {
 
 export function markSuperseded(factId: number): void {
   db().prepare("UPDATE memory_facts SET is_latest = 0 WHERE id = ?").run(factId);
+  // Also remove from user_profile so superseded facts stop appearing in context
+  db().prepare("DELETE FROM user_profile WHERE source_fact_id = ?").run(factId);
 }
 
 export function insertRelation(

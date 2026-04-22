@@ -135,6 +135,9 @@ async function main(): Promise<void> {
       }
 
       if (mode !== "silent") {
+        // Small delay — gives iMessage time to deliver any trailing messages
+        // (e.g. link previews, follow-up texts sent right after) before we respond
+        await new Promise((resolve) => setTimeout(resolve, 500));
         console.log("[alfred] building context...");
         const systemPrompt = await buildContext(buffer, mode);
         console.log("[alfred] calling LLM...");
