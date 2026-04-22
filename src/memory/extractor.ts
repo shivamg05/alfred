@@ -3,9 +3,14 @@ import { z } from "zod";
 import { config } from "../config.js";
 import {
   insertFact,
+  insertRelation,
+  markSuperseded,
   insertReminder,
   updateChromaId,
   upsertProfileFact,
+  getStaticProfileFacts,
+  getDynamicProfileFacts,
+  searchFactsFTS,
 } from "./facts.js";
 import { upsertFact as chromaUpsert } from "./vectors.js";
 import { createTask } from "../integrations/todoist.js";
@@ -52,9 +57,18 @@ const extractionSchema = z
   })
   .transform((data) => ({
     facts: data.facts
-      .map((f) => factSchema.safeParse(f))
-      .filter((f) => f.success)
-      .map((f) => (f as { success: true; data: z.infer<typeof factSchema> }).data),
+      .map((f): z.infer<typeof factSchema> | null => {
+        // LLM sometimes returns plain strings instead of objects — normalise them
+        if (typeof f === "string") {
+          const text = f.trim();
+          return text
+            ? { text, is_static: false, forget_after: undefined, event_date: undefined, contradicts_hint: undefined }
+            : null;
+        }
+        const r = factSchema.safeParse(f);
+        return r.success ? r.data : null;
+      })
+      .filter((f): f is z.infer<typeof factSchema> => f !== null && f.text.length > 0),
     reminders: data.reminders
       .map((r) => reminderSchema.safeParse(r))
       .filter((r) => r.success)
@@ -92,11 +106,15 @@ function llm(): OpenAI {
 // System prompt — aggressive, 5-category extraction
 // ---------------------------------------------------------------------------
 
-function buildExtractionPrompt(documentDate: string): string {
+function buildExtractionPrompt(documentDate: string, existingFacts: string[]): string {
+  const existingSection = existingFacts.length > 0
+    ? `\nWHAT YOU ALREADY KNOW (do NOT re-extract these unless they changed):\n${existingFacts.map(f => `- ${f}`).join("\n")}\n`
+    : "";
+
   return `You extract structured memory from one or more personal iMessages. The user is texting a personal AI journal about their life.
 
-IMPORTANT: Extract aggressively. Better to over-extract than miss something. If a message contains information about the user's life, extract it as a fact.
-
+IMPORTANT: Extract aggressively. Better to over-extract than miss something. If a message contains genuinely NEW information, extract it. Skip anything already captured in "What you already know".
+${existingSection}
 Today's datetime: ${documentDate}
 
 Return a JSON object — all fields required (use empty arrays if nothing applies):
@@ -108,7 +126,9 @@ Return a JSON object — all fields required (use empty arrays if nothing applie
 }
 
 ═══════════════════════
-FACTS — 5 categories:
+FACTS — each fact MUST be a JSON object, not a string:
+  { "text": "User ...", "is_static": true/false }
+5 categories:
 ═══════════════════════
 
 1. PROFILE (stable, long-term — is_static: true)
@@ -161,7 +181,7 @@ TODOIST_TASKS — implicit future intent:
 ═══════════════════════
 Triggers: "i need to", "i have to", "gotta", "should probably", "need to get"
 content: short actionable title
-due_string: natural language due date if mentioned
+due_string: natural language date ONLY if user mentioned one ("tomorrow", "next monday", "in 3 days"). OMIT entirely if no date was given — do NOT write "no specific due date" or similar.
 
 ═══════════════════════
 FOLLOW_UP_REMINDERS — deferred plans:
@@ -185,12 +205,15 @@ export async function extractFromMessage(opts: {
   const cfg = config();
   console.log(`[extractor] running on message ${opts.messageId} (${opts.messageText.length} chars)`);
 
+  // Fetch existing profile so the model can skip duplicates and flag updates
+  const existingFacts = [...getStaticProfileFacts(), ...getDynamicProfileFacts()];
+
   let raw: string;
   try {
     const response = await llm().chat.completions.create({
       model: cfg.EXTRACTION_MODEL,
       messages: [
-        { role: "system", content: buildExtractionPrompt(opts.documentDate) },
+        { role: "system", content: buildExtractionPrompt(opts.documentDate, existingFacts) },
         { role: "user", content: opts.messageText },
       ],
       max_tokens: 1500,
@@ -257,6 +280,24 @@ export async function extractFromMessage(opts: {
         source_message_id: opts.messageId || undefined,
       });
 
+      // Contradiction resolver — if the model flagged this as superseding an
+      // existing fact, find it via FTS5 and write the versioning chain.
+      if (fact.contradicts_hint) {
+        try {
+          const candidates = searchFactsFTS(fact.contradicts_hint, 5).filter(
+            (c) => c.id !== factId,
+          );
+          if (candidates.length > 0) {
+            const old = candidates[0];
+            insertRelation(factId, old.id, "updates");
+            markSuperseded(old.id);
+            console.log(`[extractor] superseded fact ${old.id}: "${old.text}"`);
+          }
+        } catch (err) {
+          console.error(`[extractor] contradiction resolver failed:`, err);
+        }
+      }
+
       try {
         const chromaId = await chromaUpsert(factId, fact.text, {
           is_static: fact.is_static,
@@ -292,6 +333,29 @@ export async function extractFromMessage(opts: {
       });
       if (created) {
         console.log(`[todoist] created task: "${task.content}"`);
+
+        // Mirror the task as a local reminder so Alfred's proactive engine fires it.
+        // Use the task's due date at 9am, or now+30min if the due date is already today
+        // and 9am has passed.
+        try {
+          let due_at: string;
+          if (created.due?.date) {
+            const nineAm = new Date(`${created.due.date}T09:00:00`);
+            const thirtyMinsFromNow = new Date(Date.now() + 30 * 60 * 1000);
+            due_at = nineAm > new Date() ? nineAm.toISOString() : thirtyMinsFromNow.toISOString();
+          } else {
+            // No due date returned — remind in 30 minutes as a gentle nudge
+            due_at = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+          }
+          insertReminder({
+            text: task.content,
+            due_at,
+            source_message_id: opts.messageId || undefined,
+          });
+          console.log(`[todoist] reminder set for "${task.content}" at ${due_at}`);
+        } catch (err) {
+          console.error(`[extractor] reminder for todoist task failed:`, err);
+        }
       }
     } catch (err) {
       console.error(`[extractor] todoist task creation failed:`, err);

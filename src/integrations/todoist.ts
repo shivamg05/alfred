@@ -55,12 +55,18 @@ export async function createTask(opts: {
   if (!token) return null;
 
   try {
+    // Use the provided due_string if it looks like a real date; otherwise default to "today".
+    // LLM sometimes writes "no specific due date" or similar which Todoist rejects with a 400.
+    const hasRealDate = opts.due_string &&
+      /\d|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next|week|month|morning|evening|night/i.test(opts.due_string);
+    const dueString = hasRealDate ? opts.due_string : "today";
+
     const res = await fetch(`${BASE}/tasks`, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({
         content: opts.content,
-        ...(opts.due_string ? { due_string: opts.due_string } : {}),
+        due_string: dueString,
       }),
     });
     if (!res.ok) {

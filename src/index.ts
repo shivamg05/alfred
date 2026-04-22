@@ -1,4 +1,10 @@
-import "dotenv/config";
+// Load .env from project root regardless of cwd — needed when running as a
+// different macOS user whose home dir differs from the project location.
+import { config as loadEnv } from "dotenv";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
+const __envPath = resolve(dirname(fileURLToPath(import.meta.url)), "../.env");
+loadEnv({ path: __envPath });
 import { IMessageSDK } from "@photon-ai/imessage-kit";
 import type { Message } from "@photon-ai/imessage-kit";
 import { config } from "./config.js";
@@ -120,6 +126,13 @@ async function main(): Promise<void> {
       // Classify intent — determines whether to reply at all and how long
       const mode = await classifyIntent(effectiveText);
       console.log(`[alfred] mode: ${mode}`);
+
+      // For silent messages, occasionally send a brief acknowledgment (~50% of the time)
+      if (mode === "silent" && Math.random() < 0.4) {
+        const acks = ["👍", "👀", "noted", "gotcha"];
+        const ack = acks[Math.floor(Math.random() * acks.length)];
+        await sendBubbles(sdk, ack);
+      }
 
       if (mode !== "silent") {
         console.log("[alfred] building context...");
