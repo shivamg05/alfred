@@ -8,6 +8,7 @@ import {
   upsertProfileFact,
 } from "./facts.js";
 import { upsertFact as chromaUpsert } from "./vectors.js";
+import { createTask } from "../integrations/todoist.js";
 
 const factSchema = z.object({
   text: z.string(),
@@ -22,16 +23,25 @@ const reminderSchema = z.object({
   due_at: z.string(),
 });
 
+const todoistTaskSchema = z.object({
+  content: z.string(),
+  due_string: z.string().optional(),
+});
+
 const extractionSchema = z.object({
   facts: z.array(factSchema).default([]),
   reminders: z.array(z.unknown()).default([]),
+  todoist_tasks: z.array(z.unknown()).default([]),
 }).transform((data) => ({
   facts: data.facts,
-  // filter out any reminders that don't have both text and due_at
   reminders: data.reminders
     .map((r) => reminderSchema.safeParse(r))
     .filter((r) => r.success)
     .map((r) => (r as { success: true; data: { text: string; due_at: string } }).data),
+  todoist_tasks: data.todoist_tasks
+    .map((t) => todoistTaskSchema.safeParse(t))
+    .filter((t) => t.success)
+    .map((t) => (t as { success: true; data: { content: string; due_string?: string } }).data),
 }));
 
 let _client: OpenAI | null = null;
@@ -68,7 +78,12 @@ Rules for reminders:
 - Only extract when user explicitly says "remind me", "don't let me forget", etc.
 - due_at: ISO8601 datetime
 
-If the message has no facts worth remembering, return: {"facts": [], "reminders": []}`;
+Rules for todoist_tasks:
+- Only extract when the user expresses a clear intention to do something ("i need to", "i have to", "gotta", "should probably")
+- content: short actionable task title
+- due_string: natural language due date if mentioned (e.g. "tomorrow", "next Monday") — optional
+
+If the message has no extractable content, return: {"facts": [], "reminders": [], "todoist_tasks": []}`;
 
 export async function extractFromMessage(opts: {
   messageText: string;
@@ -136,5 +151,16 @@ export async function extractFromMessage(opts: {
       is_static: fact.is_static,
       source_fact_id: factId,
     });
+  }
+
+  // Create Todoist tasks for clearly actionable items
+  for (const task of parsed.todoist_tasks) {
+    const created = await createTask({
+      content: task.content,
+      due_string: task.due_string,
+    });
+    if (created) {
+      console.log(`[todoist] created task: "${task.content}"`);
+    }
   }
 }
