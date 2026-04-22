@@ -9,6 +9,7 @@ export interface MemoryFact {
   event_date?: string;
   forget_after?: string;
   chroma_id?: string;
+  source_message_id?: number;
 }
 
 export interface Reminder {
@@ -121,7 +122,7 @@ export function getActiveDynamicFacts(): MemoryFact[] {
 export function getFactById(id: number): MemoryFact | undefined {
   return db()
     .prepare(
-      `SELECT id, text, is_static, document_date, event_date, forget_after, chroma_id
+      `SELECT id, text, is_static, document_date, event_date, forget_after, chroma_id, source_message_id
        FROM memory_facts WHERE id = ?`,
     )
     .get(id) as MemoryFact | undefined;
@@ -204,6 +205,44 @@ export function insertMessage(msg: {
       msg.file_summary ?? null,
     );
   return result.lastInsertRowid as number;
+}
+
+export function getMessageById(
+  id: number,
+): { raw_text: string | null; transcript: string | null } | undefined {
+  return db()
+    .prepare("SELECT raw_text, transcript FROM messages WHERE id = ?")
+    .get(id) as { raw_text: string | null; transcript: string | null } | undefined;
+}
+
+export interface FTSHit {
+  id: number;
+  text: string;
+  rank: number;
+}
+
+/** BM25 full-text keyword search over memory_facts. */
+export function searchFactsFTS(query: string, limit = 10): FTSHit[] {
+  try {
+    // Sanitize query — FTS5 MATCH is picky about special chars
+    const safe = query.replace(/['"*\-]/g, " ").trim();
+    if (!safe) return [];
+    return db()
+      .prepare(
+        `SELECT mf.id, mf.text, fts.rank
+         FROM memory_facts_fts fts
+         JOIN memory_facts mf ON mf.id = fts.rowid
+         WHERE memory_facts_fts MATCH ?
+           AND mf.user_id = ?
+           AND mf.is_latest = 1
+           AND mf.is_forgotten = 0
+         ORDER BY fts.rank
+         LIMIT ?`,
+      )
+      .all(safe, config().USER_ID, limit) as FTSHit[];
+  } catch {
+    return []; // FTS can fail on edge-case queries; don't crash retrieval
+  }
 }
 
 export function getRecentMessages(

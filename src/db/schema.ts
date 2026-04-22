@@ -84,5 +84,25 @@ function applySchema(db: Database.Database): void {
       content_sent TEXT NOT NULL,
       sent_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- FTS5 for BM25 keyword search alongside ChromaDB semantic search
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts
+      USING fts5(text, content='memory_facts', content_rowid='id', tokenize='unicode61');
+
+    CREATE TRIGGER IF NOT EXISTS memory_facts_fts_insert
+      AFTER INSERT ON memory_facts BEGIN
+        INSERT INTO memory_facts_fts(rowid, text) VALUES (new.id, new.text);
+      END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_facts_fts_update
+      AFTER UPDATE ON memory_facts BEGIN
+        INSERT INTO memory_facts_fts(memory_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+        INSERT INTO memory_facts_fts(rowid, text) VALUES (new.id, new.text);
+      END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_facts_fts_delete
+      AFTER DELETE ON memory_facts BEGIN
+        INSERT INTO memory_facts_fts(memory_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+      END;
   `);
 }

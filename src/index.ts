@@ -11,8 +11,44 @@ import { transcribeAudio } from "./ingestion/transcription.js";
 import { summarizeImage, summarizeFile } from "./ingestion/fileParser.js";
 import { buildContext } from "./orchestrator/context.js";
 import { chat } from "./orchestrator/llm.js";
+import { classifyIntent } from "./orchestrator/classifier.js";
 import { sendBubbles } from "./orchestrator/response.js";
 import { checkDueReminders, registerCronJobs } from "./proactive/engine.js";
+
+// ---------------------------------------------------------------------------
+// Session buffer — batches messages before extraction for richer context
+// (Supermemory insight: extracting from a session gives better coreference
+//  resolution and more contextual facts than per-message extraction)
+// ---------------------------------------------------------------------------
+const SESSION_MAX = 5;                   // flush after this many messages
+const SESSION_IDLE_MS = 2 * 60 * 1000;  // or after 2 min of silence
+
+interface BufferedMsg { text: string; messageId: number }
+const sessionBuffer: BufferedMsg[] = [];
+let sessionTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushExtractionBuffer(): void {
+  if (sessionBuffer.length === 0) return;
+  const batch = sessionBuffer.splice(0);
+  const sessionText = batch.map((m) => m.text).join("\n");
+  const lastMessageId = batch[batch.length - 1].messageId;
+  console.log(`[alfred] extraction flush (${batch.length} messages)`);
+  extractFromMessage({
+    messageText: sessionText,
+    messageId: lastMessageId,
+    documentDate: new Date().toISOString(),
+  }).catch((err) => console.error("[alfred] extraction error:", err));
+}
+
+function queueForExtraction(text: string, messageId: number): void {
+  sessionBuffer.push({ text, messageId });
+  if (sessionTimer) clearTimeout(sessionTimer);
+  if (sessionBuffer.length >= SESSION_MAX) {
+    flushExtractionBuffer();
+  } else {
+    sessionTimer = setTimeout(flushExtractionBuffer, SESSION_IDLE_MS);
+  }
+}
 
 async function main(): Promise<void> {
   const cfg = config();
@@ -81,32 +117,33 @@ async function main(): Promise<void> {
         timestamp: new Date().toISOString(),
       });
 
-      // Build context and respond
-      console.log("[alfred] building context...");
-      const systemPrompt = await buildContext(buffer);
-      console.log("[alfred] calling LLM...");
-      const reply = await chat(systemPrompt, effectiveText);
-      console.log("[alfred] reply:", reply);
+      // Classify intent — determines whether to reply at all and how long
+      const mode = await classifyIntent(effectiveText);
+      console.log(`[alfred] mode: ${mode}`);
 
-      await sendBubbles(sdk, reply);
-      console.log("[alfred] sent reply");
+      if (mode !== "silent") {
+        console.log("[alfred] building context...");
+        const systemPrompt = await buildContext(buffer, mode);
+        console.log("[alfred] calling LLM...");
+        const reply = await chat(systemPrompt, effectiveText);
+        console.log("[alfred] reply:", reply);
 
-      // Add Alfred's reply to buffer
-      buffer.push({
-        role: "assistant",
-        content: reply.replace(/\[SPLIT\]/g, " "),
-        timestamp: new Date().toISOString(),
-      });
+        await sendBubbles(sdk, reply);
+        console.log("[alfred] sent reply");
+
+        // Add Alfred's reply to buffer
+        buffer.push({
+          role: "assistant",
+          content: reply.replace(/\[SPLIT\]/g, " "),
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       // Fire any due reminders triggered by this message
       checkDueReminders(sdk);
 
-      // Background: extract memory facts (don't await — keep response fast)
-      extractFromMessage({
-        messageText: effectiveText,
-        messageId,
-        documentDate: new Date().toISOString(),
-      }).catch((err) => console.error("[alfred] extraction error:", err));
+      // Queue for session-based extraction (batches up to 5 messages or 2 min idle)
+      queueForExtraction(effectiveText, messageId);
       } catch (err) {
         console.error("[alfred] handler error:", err);
       }

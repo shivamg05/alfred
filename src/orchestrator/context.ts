@@ -3,32 +3,35 @@ import { retrieveContext } from "../memory/retrieval.js";
 import { buildSystemPrompt } from "../tone/systemPrompt.js";
 import { getTasks, formatTasksForContext } from "../integrations/todoist.js";
 import { config } from "../config.js";
+import { ResponseMode } from "./classifier.js";
 
-let _cachedTasks: string = "none";
+let _cachedTasksStr: string = "none";
 let _lastTaskFetch = 0;
-const TASK_CACHE_MS = 30 * 60 * 1000; // 30 min
+const TASK_CACHE_MS = 30 * 60 * 1000;
 
-async function getCachedTasks(): Promise<string> {
+async function getTaskContext(): Promise<string> {
   if (!config().TODOIST_API_TOKEN) return "";
   const now = Date.now();
   if (now - _lastTaskFetch > TASK_CACHE_MS) {
     const tasks = await getTasks();
-    _cachedTasks = formatTasksForContext(tasks);
+    _cachedTasksStr = formatTasksForContext(tasks);
     _lastTaskFetch = now;
   }
-  return _cachedTasks;
+  return _cachedTasksStr;
 }
 
 export async function buildContext(
   buffer: ConversationBuffer,
+  mode: ResponseMode = "full",
 ): Promise<string> {
   const recentMessages = buffer.getRecent(20);
-  const latestUserMsg = recentMessages.filter((m) => m.role === "user").at(-1)?.content ?? "";
+  const latestUserMsg =
+    recentMessages.filter((m) => m.role === "user").at(-1)?.content ?? "";
 
   const [memoryContext, todoistTasks] = await Promise.all([
     retrieveContext(latestUserMsg),
-    getCachedTasks(),
+    getTaskContext(),
   ]);
 
-  return buildSystemPrompt(memoryContext, recentMessages, todoistTasks);
+  return buildSystemPrompt(memoryContext, recentMessages, todoistTasks, mode);
 }

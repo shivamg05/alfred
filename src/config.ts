@@ -20,6 +20,7 @@ const schema = z.object({
 
   // Integrations
   TODOIST_API_TOKEN: z.string().optional(),
+  FIRECRAWL_API_KEY: z.string().optional(),
 
   // Behaviour
   QUIET_HOURS_START: z.coerce.number().min(0).max(23).default(0),  // midnight
