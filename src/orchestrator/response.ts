@@ -10,7 +10,7 @@ export async function sendBubbles(sdk: IMessageSDK, text: string): Promise<void>
   for (let i = 0; i < bubbles.length; i++) {
     await sdk.send({ to: config().USER_PHONE, text: bubbles[i] });
     if (i < bubbles.length - 1) {
-      await sleep(1000);
+      await sleep(1500);
     }
   }
 }

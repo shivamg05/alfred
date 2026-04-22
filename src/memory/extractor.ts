@@ -1,6 +1,6 @@
-import OpenAI from "openai";
 import { z } from "zod";
 import { config } from "../config.js";
+import { makeOpenAIClient } from "../orchestrator/llm.js";
 import {
   insertFact,
   insertRelation,
@@ -87,18 +87,22 @@ const extractionSchema = z
   }));
 
 // ---------------------------------------------------------------------------
-// LLM client
+// Helpers
 // ---------------------------------------------------------------------------
 
+/** Strip markdown code fences — some models wrap JSON in ```json ... ``` */
+function stripCodeFences(s: string): string {
+  return s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+}
+
+// ---------------------------------------------------------------------------
+// LLM client (shared factory — includes OpenRouter headers when applicable)
+// ---------------------------------------------------------------------------
+
+import OpenAI from "openai";
 let _client: OpenAI | null = null;
 function llm(): OpenAI {
-  if (!_client) {
-    const cfg = config();
-    _client = new OpenAI({
-      apiKey: cfg.OPENAI_API_KEY,
-      ...(cfg.LLM_BASE_URL ? { baseURL: cfg.LLM_BASE_URL } : {}),
-    });
-  }
+  if (!_client) _client = makeOpenAIClient();
   return _client;
 }
 
@@ -175,7 +179,7 @@ EXTRACTION RULES:
 ═══════════════════════
 REMINDERS — only explicit asks:
 ═══════════════════════
-Triggers: "remind me", "don't let me forget", "ping me at X"
+Triggers: "remind me", "don't let me forget", "ping me at X", "i have to", "i need to"
 due_at: ISO8601 datetime (use today's date + time context to compute)
 
 ═══════════════════════
@@ -230,7 +234,7 @@ export async function extractFromMessage(opts: {
 
   let parsed: z.infer<typeof extractionSchema>;
   try {
-    parsed = extractionSchema.parse(JSON.parse(raw));
+    parsed = extractionSchema.parse(JSON.parse(stripCodeFences(raw)));
   } catch (err) {
     console.error("[extractor] parse failed:", raw, err);
     return;

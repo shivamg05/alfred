@@ -89,6 +89,13 @@ async function main(): Promise<void> {
       // Only process messages from the user (not from Alfred itself)
       if (msg.isFromMe) return;
 
+      // Skip iMessage tapback reactions (Liked/Loved/Laughed at/etc.)
+      const reactionPattern = /^(Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+[""\u201C\u201D]/i;
+      if (msg.text && reactionPattern.test(msg.text.trim())) {
+        console.log(`[alfred] skipping tapback reaction: "${msg.text.slice(0, 60)}"`);
+        return;
+      }
+
       console.log(`[alfred] message received from ${msg.participant ?? msg.chatId}`);
 
       let transcript: string | undefined;
@@ -128,8 +135,8 @@ async function main(): Promise<void> {
       console.log(`[alfred] mode: ${mode}`);
 
       // For silent messages, occasionally send a brief acknowledgment (~50% of the time)
-      if (mode === "silent" && Math.random() < 0.4) {
-        const acks = ["👍", "👀", "noted", "gotcha"];
+      if (mode === "silent" && Math.random() < 0.3) {
+        const acks = ["👍", "👀", "ok", "gotcha"];
         const ack = acks[Math.floor(Math.random() * acks.length)];
         await sendBubbles(sdk, ack);
       }

@@ -8,21 +8,25 @@ const schema = z.object({
   mode: z.enum(["silent", "brief", "full"]),
 });
 
-const PROMPT = `Decide how Alfred should respond to this iMessage.
+/** Strip markdown code fences in case the model wraps its JSON output */
+function stripFences(s: string): string {
+  return s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+}
 
-Return JSON: { "mode": "silent" | "brief" | "full" }
+const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "brief" | "full" }
 
-silent — user is logging something for memory. No reply expected, potentially an acknowledgment (such as a 👍 or 'gotcha' or 'cool' etc). Pure info dumps, plans stated flatly, facts about their day.
-  e.g. "my summer is split into 3 tracks", "meeting got moved to thursday", "woke up at 7", etc
+BIAS HARD toward silent and brief. Most messages don't need a full response.
 
-brief — worth a reaction or quick take, but not a full conversation. One sentence max.
-  e.g. "wanna read that paper later", "just finished the project", "kind of nervous about tomorrow", "might apply to that fellowship", etc
+silent — logging, venting, info dump, no question asked, short reactions ("lol", "fr", "damn", "ok", "yeah", "nice")
+  → "my summer is split into 3 tracks" / "woke up at 7" / "lol fr" / "ya true" / "deadass" / "bet"
 
-full — user wants actual back-and-forth, help, or asked a real question.
-  e.g. "what do you think about X", "help me plan Y", "should I do A or B", "can you look up Z", etc
+brief — worth a quick take but not a full conversation. One sentence.
+  → "kinda nervous about tomorrow" / "just finished the project" / "might apply to that fellowship" / "thinking about X"
 
-When torn between silent and brief, go brief.
-When torn between brief and full, go brief.`;
+full — explicit question, request for help, or asking for Alfred's opinion on something specific.
+  → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?"
+
+Default to brief if unsure. Only pick full if they clearly want a response.`;
 
 export async function classifyIntent(
   userMessage: string,
@@ -34,15 +38,14 @@ export async function classifyIntent(
         { role: "system", content: PROMPT },
         { role: "user", content: userMessage },
       ],
-      max_tokens: 20,
+      max_tokens: 60,
       temperature: 0,
-      response_format: { type: "json_object" },
     });
 
-    const raw = response.choices[0]?.message?.content ?? '{"mode":"full"}';
-    const parsed = schema.safeParse(JSON.parse(raw));
-    return parsed.success ? parsed.data.mode : "full";
+    const raw = response.choices[0]?.message?.content ?? '{"mode":"brief"}';
+    const parsed = schema.safeParse(JSON.parse(stripFences(raw)));
+    return parsed.success ? parsed.data.mode : "brief";
   } catch {
-    return "full"; // fail open — always respond rather than go silent on error
+    return "brief"; // fail to brief, not full
   }
 }
