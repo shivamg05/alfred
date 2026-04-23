@@ -225,6 +225,20 @@ export function getStaticProfileFacts(): string[] {
   ).map((r) => r.fact);
 }
 
+export function getUpcomingEventFacts(withinDays: number): MemoryFact[] {
+  return db()
+    .prepare(
+      `SELECT id, text, is_static, is_latest, is_forgotten, document_date, event_date, forget_after, chroma_id, source_message_id
+       FROM memory_facts
+       WHERE user_id = ? AND is_latest = 1 AND is_forgotten = 0
+         AND event_date IS NOT NULL
+         AND event_date >= date('now')
+         AND event_date <= date('now', '+' || ? || ' days')
+       ORDER BY event_date ASC`,
+    )
+    .all(config().USER_ID, withinDays) as MemoryFact[];
+}
+
 export function getDynamicProfileFacts(): string[] {
   return (
     db()

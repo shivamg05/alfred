@@ -3,19 +3,44 @@ import type { IMessageSDK } from "@photon-ai/imessage-kit";
 import {
   getDueReminders,
   markReminderFired,
-  getDynamicProfileFacts,
-  getStaticProfileFacts,
+  getUpcomingEventFacts,
   logProactive,
 } from "../memory/facts.js";
 import { shouldSendProactive } from "./gate.js";
 import { sendBubbles } from "../orchestrator/response.js";
-import { generateProactive } from "../orchestrator/llm.js";
-import { buildSystemPrompt } from "../tone/systemPrompt.js";
-import { retrieveContext } from "../memory/retrieval.js";
+import { chat } from "../orchestrator/llm.js";
+import { fetchContext, buildPrompt } from "../orchestrator/context.js";
+import { ConversationBuffer } from "../memory/shortTerm.js";
 
-async function makeProactiveSystemPrompt(): Promise<string> {
-  const ctx = await retrieveContext("what should i check in with them about");
-  return buildSystemPrompt(ctx, []);
+const PROACTIVE_SUFFIX = `
+
+YOU ARE INITIATING THIS MESSAGE UNPROMPTED. Rules:
+- Only send if you have something genuinely useful or timely to say
+- If there's nothing worth saying, reply with exactly: SKIP
+- One bubble max. No questions unless it's the whole point.
+- Don't announce that you're checking in. Just say the thing.`;
+
+async function runProactiveChat(
+  sdk: IMessageSDK,
+  trigger: string,
+  logType: string,
+): Promise<void> {
+  const emptyBuffer = new ConversationBuffer();
+  const contextData = await fetchContext(emptyBuffer);
+  const systemPrompt = buildPrompt(contextData, "full") + PROACTIVE_SUFFIX;
+
+  const msg = await chat(systemPrompt, `[internal: ${trigger}]`);
+
+  if (!msg || msg.trim() === "SKIP" || msg.toUpperCase().includes("SKIP")) {
+    console.log(`[proactive] ${logType} → skipped`);
+    return;
+  }
+
+  if (shouldSendProactive(msg)) {
+    console.log(`[proactive] ${logType}: "${msg.slice(0, 80)}"`);
+    await sendBubbles(sdk, msg);
+    logProactive(logType, msg);
+  }
 }
 
 export function checkDueReminders(sdk: IMessageSDK): void {
@@ -31,41 +56,39 @@ export function checkDueReminders(sdk: IMessageSDK): void {
 }
 
 export function registerCronJobs(sdk: IMessageSDK): void {
-  // morning brief — 9am
+  // 9am — morning brief: today's tasks + upcoming events in next 7 days
   cron.schedule("0 9 * * *", async () => {
-    const systemPrompt = await makeProactiveSystemPrompt();
-    const dynamic = getDynamicProfileFacts();
-    if (dynamic.length === 0) return;
-    const trigger = `morning check-in. relevant context: ${dynamic.slice(0, 3).join("; ")}`;
-    const msg = await generateProactive(systemPrompt, trigger);
-    if (shouldSendProactive(msg)) {
-      await sendBubbles(sdk, msg);
-      logProactive("morning_brief", msg);
-    }
+    const upcoming = getUpcomingEventFacts(7);
+    const upcomingStr = upcoming.length > 0
+      ? upcoming.map((f) => `${f.text}${f.event_date ? ` (${f.event_date})` : ""}`).join("; ")
+      : "none";
+
+    const trigger = `morning brief. check their todoist tasks for today using todoist_list_tasks. upcoming events from memory: ${upcomingStr}. if there's something worth flagging — an overdue task, something happening soon, anything they should know today — say it. otherwise SKIP.`;
+
+    await runProactiveChat(sdk, trigger, "morning_brief").catch(console.error);
   });
 
-  // midday pulse — 1pm (surface a relevant memory)
+  // 1pm — only fires if something is happening in the next 48 hours
   cron.schedule("0 13 * * *", async () => {
-    const systemPrompt = await makeProactiveSystemPrompt();
-    const ctx = await retrieveContext("something interesting from the past worth remembering");
-    if (ctx.retrieved.length === 0) return;
-    const trigger = `surface one connection from the past that might be interesting to bring up: "${ctx.retrieved[0]}"`;
-    const msg = await generateProactive(systemPrompt, trigger);
-    if (shouldSendProactive(msg)) {
-      await sendBubbles(sdk, msg);
-      logProactive("midday_pulse", msg);
+    const upcoming48h = getUpcomingEventFacts(2);
+    if (upcoming48h.length === 0) {
+      console.log("[proactive] midday_pulse → nothing upcoming, skipped");
+      return;
     }
+
+    const upcomingStr = upcoming48h
+      .map((f) => `${f.text}${f.event_date ? ` (${f.event_date})` : ""}`)
+      .join("; ");
+
+    const trigger = `midday heads up. something is happening in the next 48 hours: ${upcomingStr}. send a brief, natural reminder if it's actually useful. otherwise SKIP.`;
+
+    await runProactiveChat(sdk, trigger, "midday_pulse").catch(console.error);
   });
 
-  // evening wrap — 7pm (overdue reminders + inactivity check)
+  // 7pm — evening: check open/overdue todoist tasks, only send if there's something real
   cron.schedule("0 19 * * *", async () => {
-    const systemPrompt = await makeProactiveSystemPrompt();
-    const dynamic = getDynamicProfileFacts();
-    const trigger = `evening check-in. wrap up the day and check in: ${dynamic.slice(0, 2).join("; ")}`;
-    const msg = await generateProactive(systemPrompt, trigger);
-    if (shouldSendProactive(msg)) {
-      await sendBubbles(sdk, msg);
-      logProactive("evening_wrap", msg);
-    }
+    const trigger = `evening check-in. use todoist_list_tasks with filter "today | overdue" to see what's still open. if there are overdue or incomplete tasks worth flagging, do it. if nothing meaningful is open, SKIP.`;
+
+    await runProactiveChat(sdk, trigger, "evening_wrap").catch(console.error);
   });
 }
