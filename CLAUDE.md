@@ -22,6 +22,11 @@ Type-check only (no run):
 pnpm typecheck
 ```
 
+Visualize the memory graph:
+```bash
+pnpm memory
+```
+
 ## Architecture in one paragraph
 
 iMessage messages arrive via the imessage-kit WAL watcher → routed by type (text/audio/image/file) → transcribed or summarized if needed → stored in SQLite → LLM response generated with a 3-tier context window (in-memory buffer + SQLite working memory + ChromaDB semantic search) → sent back as multiple iMessage bubbles → background job extracts atomic facts, reminders, and Todoist tasks from the message.
@@ -36,9 +41,9 @@ iMessage messages arrive via the imessage-kit WAL watcher → routed by type (te
 | `src/memory/facts.ts` | All SQLite reads/writes for facts, reminders, profile, proactive log. Includes `searchFactsFTS()` |
 | `src/memory/vectors.ts` | ChromaDB client. Uses `text-embedding-3-small` via OpenRouter (or direct OpenAI if key is native) |
 | `src/memory/extractor.ts` | Session-based extraction: 5-category prompt, dedup via existing profile injection, contradiction resolver |
-| `src/memory/retrieval.ts` | Hybrid retrieval: ChromaDB semantic + FTS5 BM25 merged via RRF, with source chunk injection |
-| `src/orchestrator/context.ts` | Assembles the context window from all 3 memory tiers + Todoist task cache |
-| `src/orchestrator/classifier.ts` | Intent classifier: `silent \| brief \| full` — determines response mode before LLM call |
+| `src/memory/retrieval.ts` | Hybrid retrieval: ChromaDB semantic + FTS5 BM25 merged via RRF, with graph expansion and source chunk injection |
+| `src/orchestrator/context.ts` | `fetchContext()` (retrieval, mode-independent) + `buildPrompt()` (assembles system prompt) |
+| `src/orchestrator/classifier.ts` | Intent classifier: `silent \| brief \| full`. Fires non-blocking in parallel with retrieval. 5s timeout. |
 | `src/orchestrator/llm.ts` | Multi-iteration tool-calling loop (max 8 turns). Tools run in parallel via Promise.all |
 | `src/tone/systemPrompt.ts` | Alfred's personality + mode-aware length rules + NOW timestamp injection |
 | `src/proactive/engine.ts` | Three cron jobs: 9am brief, 1pm connection, 7pm wrap |
@@ -46,6 +51,9 @@ iMessage messages arrive via the imessage-kit WAL watcher → routed by type (te
 | `src/tools/registry.ts` | Tool definitions (OpenAI schema) + dispatcher. Logs both call and result |
 | `src/tools/web.ts` | Firecrawl v2 search + scrape. Rewrites Twitter/X URLs to fxtwitter.com |
 | `src/tools/todoist.ts` | Tool dispatch layer over `integrations/todoist.ts` |
+| `src/ingestion/attachments.ts` | WAL-race fallback: queries chat.db directly for attachments. `resolveAttachments()` returns all. |
+| `scripts/memory-graph.ts` | CLI visualizer: shows facts, edge counts, bedrock nodes, relates_to graph |
+| `scripts/backfill-graph.ts` | One-time script: embeds unembedded facts and wires relates_to edges retroactively |
 
 ## Memory layer
 
@@ -55,37 +63,51 @@ Three tiers assembled into every context window:
 2. **Working memory** — SQLite. Active reminders + user profile (static and dynamic facts)
 3. **Long-term** — ChromaDB + FTS5. Every extracted fact, searchable semantically and by keyword
 
+### Knowledge graph
+
+Facts are nodes; `fact_relations` rows are edges. Edge types: `relates_to` (semantic similarity), `updates` (contradiction resolved), `extends`, `derives`. Edges are stored in canonical order (`min(a,b)` as `fact_id_a`) to prevent duplicates.
+
+**Bedrock facts** — the 5 most-connected nodes, scored by `edge_count / (1 + age_days * 0.05)`. Always injected into every context window regardless of the query.
+
+**Graph expansion** — after RRF retrieval, the top 5 hits are 1-hop expanded via `relates_to` edges, adding up to 4 neighbor facts.
+
 ### Extraction (session-based)
 
-Messages are buffered (up to 5, or 2 min idle) then extracted as a batch. This gives the LLM full conversation context for better coreference resolution. The extractor:
-- Injects existing profile facts into the prompt so the model skips duplicates
+Messages are buffered (up to 5, or 2 min idle) then extracted as a batch. The extractor:
+- Injects existing profile facts + FTS-matched topical facts so the model skips near-duplicates
+- Pre-insertion guard: skips facts with ChromaDB distance < 0.15 to an existing fact
+- Auto-wires `relates_to` edges for new facts with similarity 0.12–0.55 to existing facts
 - Extracts across 5 categories: Profile, Current Context, Preferences, Events, Updates
-- Runs a contradiction resolver: facts with `contradicts_hint` trigger an FTS5 search for the old fact → writes `fact_relations` row, marks old as `is_latest = 0`
-- Mirrors every created Todoist task as a local reminder (fires at 9am on due date, or now+30min)
+- Runs a contradiction resolver: facts with `contradicts_hint` mark old fact `is_latest = 0`
+- Mirrors every created Todoist task as a local reminder
 
 ### Retrieval (hybrid RRF)
 
-At response time, both ChromaDB (semantic) and FTS5 (BM25 keyword) are queried. Results are merged via Reciprocal Rank Fusion, then each retrieved fact is annotated with its source message snippet for richer LLM context.
+At response time, ChromaDB (semantic) and FTS5 (BM25 keyword) are both queried. Results merged via Reciprocal Rank Fusion with recency + upcoming-event boosts, then annotated with source message snippets.
 
 ## LLM calls
 
 All LLM calls go through the OpenAI SDK pointed at `LLM_BASE_URL`. Currently: OpenRouter (`https://openrouter.ai/api/v1`). Model IDs use OpenRouter's namespaced format (`openai/gpt-4o-mini`).
 
 - **Responses**: `chat()` in `orchestrator/llm.ts` — multi-turn tool loop, `LLM_MODEL`, max 200 tokens
-- **Classifier**: `classifyIntent()` in `orchestrator/classifier.ts` — `EXTRACTION_MODEL`, max 20 tokens, temp 0
+- **Classifier**: `classifyWithTimeout()` in `orchestrator/classifier.ts` — `EXTRACTION_MODEL`, fires in parallel with retrieval, 5s timeout → "brief"
 - **Extraction**: `extractFromMessage()` in `memory/extractor.ts` — `EXTRACTION_MODEL`, max 1500 tokens
 - **Proactive**: `generateProactive()` in `orchestrator/llm.ts` — `LLM_MODEL`, max 150 tokens
-- **Embeddings**: `vectors.ts` — routes through `LLM_BASE_URL` when set, model `openai/text-embedding-3-small`
-- **Transcription**: `transcribeAudio()` — hardcoded to OpenAI `whisper-1` (needs real OpenAI key)
-- **Image**: `summarizeImage()` — hardcoded to OpenAI `gpt-4o` (needs real OpenAI key)
+- **Embeddings**: `vectors.ts` — routes through `LLM_BASE_URL`, model `openai/text-embedding-3-small`
+- **Transcription**: `transcribeAudio()` — `google/gemini-2.5-flash-lite` via OpenRouter, base64 WAV via `input_audio`; audio converted from CAF using macOS `afconvert`
+- **Image**: `summarizeImageFromPath()` — vision model via OpenRouter (`anthropic/claude-haiku-4-5`); HEIC converted to JPEG via `heic-convert`; supports multiple images in parallel
 
 ## Response flow
 
 ```
-message → classifyIntent() → silent | brief | full
-  silent (40% chance) → send random ack (👍 👀 noted gotcha)
-  brief/full → buildContext() → chat() tool loop → sendBubbles()
-  always → queueForExtraction() → session buffer → extractFromMessage()
+message arrives
+  → classifyWithTimeout() fires immediately (non-blocking)
+  → 1s debounce window
+  → Promise.all([classifier, fetchContext()])   ← parallel
+  → buildPrompt(contextData, mode)
+  → silent (30% chance) → send random ack
+  → brief/full → chat() tool loop → sendBubbles()
+  → always → queueForExtraction() → session buffer → extractFromMessage()
 ```
 
 ## Tone / personality
@@ -95,16 +117,16 @@ message → classifyIntent() → silent | brief | full
 - Direct and opinionated — commits to takes, doesn't hedge
 - Swears when it fits naturally, not constantly
 - `brief` mode: 1 sentence, ≤20 words. `full` mode: max 2 bubbles, ≤25 words each
-- `[SPLIT]` between bubbles, 800ms delay in `orchestrator/response.ts`
+- `[SPLIT]` between bubbles, 1500ms delay in `orchestrator/response.ts`
 - Current datetime injected at top of every prompt (user's timezone from `USER_TIMEZONE`)
 
 ## SQLite schema summary
 
 ```
 messages            — raw + transcript/summary, imessage_row_id
-memory_facts        — atomic facts, versioned (root/parent FK), is_latest, is_static, forget_after
+memory_facts        — atomic facts, versioned (is_latest), is_static, forget_after, chroma_id
 memory_facts_fts    — FTS5 virtual table (auto-synced via triggers)
-fact_relations      — updates | extends | derives
+fact_relations      — relates_to | updates | extends | derives (canonical min/max ordering)
 reminders           — due_at, fired_at (includes mirrored Todoist tasks)
 user_profile        — materialized static + dynamic facts (key/value)
 proactive_log       — what Alfred sent unprompted and when
@@ -123,7 +145,8 @@ See `.env.example` for all vars. Critical ones:
 ```
 ALFRED_PHONE          # Apple ID Alfred listens on
 USER_PHONE            # Your number Alfred replies to
-OPENAI_API_KEY        # Also used for Gemini/Groq if LLM_BASE_URL is set
+OPENAI_API_KEY        # Used as the API key for LLM_BASE_URL (OpenRouter key if using OpenRouter)
+LLM_BASE_URL          # OpenAI-compatible base URL (e.g. https://openrouter.ai/api/v1)
 LLM_MODEL             # default: gpt-4o-mini
 EXTRACTION_MODEL      # default: gpt-4o-mini (can be cheaper/faster)
 DB_PATH               # SQLite path — must be writable by alfred macOS user
@@ -144,3 +167,5 @@ QUIET_HOURS_END       # Hour (0-23) Alfred starts again
 **Extractor parse fails** — The LLM returned wrong JSON shape. The extraction schema is resilient (filters bad reminders/tasks rather than crashing) but if facts are empty, check the raw LLM output in the `[extractor] Parse failed` log.
 
 **Messages not appearing** — Check that the `alfred` macOS user is logged in (fast user switching) and Messages.app is open and signed in there.
+
+**Audio transcription 500 error** — OpenRouter does not support `/v1/audio/transcriptions`. Transcription uses `google/gemini-2.5-flash-lite` with base64 `input_audio` via chat completions instead.

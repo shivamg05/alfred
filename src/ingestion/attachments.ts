@@ -25,18 +25,17 @@ function expandPath(filename: string): string {
 }
 
 /**
- * Wait up to `maxWaitMs` for the attachment rows to appear, then return the
- * first non-sticker attachment. Accepts either a numeric ROWID or a guid string.
+ * Wait up to `maxWaitMs` for the attachment rows to appear, then return all
+ * non-sticker attachments. Accepts either a numeric ROWID or a guid string.
  */
-export async function resolveAttachment(
+export async function resolveAttachments(
   messageIdOrGuid: number | string,
   maxWaitMs = 5000,
-): Promise<ResolvedAttachment | null> {
+): Promise<ResolvedAttachment[]> {
   const imsgDb = config().IMESSAGE_DB_PATH;
   const intervalMs = 500;
   const attempts = Math.ceil(maxWaitMs / intervalMs);
 
-  // Build the WHERE clause depending on whether we have a rowid or guid
   const isNumeric = typeof messageIdOrGuid === "number";
   const whereClause = isNumeric
     ? "message_attachment_join.message_id = ?"
@@ -59,25 +58,33 @@ export async function resolveAttachment(
         WHERE ${whereClause}
           AND (attachment.hide_attachment IS NULL OR attachment.hide_attachment = 0)
           AND attachment.is_sticker = 0
-        ORDER BY message_attachment_join.attachment_id ASC
-        LIMIT 1`;
-      const row = db.prepare(sql).get(messageIdOrGuid) as
-        | { filename: string; mime_type: string }
-        | undefined;
+        ORDER BY message_attachment_join.attachment_id ASC`;
+      const rows = db.prepare(sql).all(messageIdOrGuid) as
+        { filename: string; mime_type: string }[];
       db.close();
 
-      if (row?.filename) {
-        const localPath = expandPath(row.filename);
-        if (existsSync(localPath)) {
-          console.log(`[attachments] resolved after ${(i + 1) * intervalMs}ms: ${localPath}`);
-          return { localPath, mimeType: row.mime_type ?? "" };
-        }
+      const resolved = rows
+        .map((row) => ({ localPath: expandPath(row.filename), mimeType: row.mime_type ?? "" }))
+        .filter((r) => existsSync(r.localPath));
+
+      if (resolved.length > 0) {
+        console.log(`[attachments] resolved ${resolved.length} attachment(s) after ${(i + 1) * intervalMs}ms`);
+        return resolved;
       }
     } catch {
       // DB locked or not ready — keep retrying
     }
   }
 
-  console.warn(`[attachments] could not resolve attachment for ${messageIdOrGuid} after ${maxWaitMs}ms`);
-  return null;
+  console.warn(`[attachments] could not resolve attachments for ${messageIdOrGuid} after ${maxWaitMs}ms`);
+  return [];
+}
+
+/** Convenience wrapper returning the first attachment (for audio/file). */
+export async function resolveAttachment(
+  messageIdOrGuid: number | string,
+  maxWaitMs = 5000,
+): Promise<ResolvedAttachment | null> {
+  const all = await resolveAttachments(messageIdOrGuid, maxWaitMs);
+  return all[0] ?? null;
 }

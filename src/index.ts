@@ -20,7 +20,7 @@ import { chat } from "./orchestrator/llm.js";
 import { classifyWithTimeout } from "./orchestrator/classifier.js";
 import { sendBubbles } from "./orchestrator/response.js";
 import { checkDueReminders, registerCronJobs } from "./proactive/engine.js";
-import { resolveAttachment } from "./ingestion/attachments.js";
+import { resolveAttachment, resolveAttachments } from "./ingestion/attachments.js";
 import { embedUnindexedFacts } from "./memory/vectors.js";
 import type { ResponseMode } from "./orchestrator/classifier.js";
 
@@ -195,38 +195,42 @@ async function main(): Promise<void> {
         let fileSummary: string | undefined;
         let type = classifyMessage(msg);
 
-        let attachmentPath: string | undefined = msg.attachments?.[0]?.localPath ?? undefined;
-        let attachmentMime: string = msg.attachments?.[0]?.mimeType ?? "";
+        // Collect all attachments — SDK path first, fallback to chat.db query
+        interface RawAttachment { localPath: string; mimeType: string }
+        let allAttachments: RawAttachment[] = (msg.attachments ?? [])
+          .filter((a) => a.localPath)
+          .map((a) => ({ localPath: a.localPath!, mimeType: a.mimeType ?? "" }));
 
-        // Trigger fallback when:
-        // - SDK gave empty attachments AND
-        // - message has attachment placeholder char OR no real text (image-only)
-        const looksLikeMedia = msg.attachments.length === 0 && (hasPlaceholder || !plainText);
-        if (!attachmentPath && (msg.hasAttachments || looksLikeMedia)) {
+        const looksLikeMedia = allAttachments.length === 0 && (hasPlaceholder || !plainText);
+        if (allAttachments.length === 0 && (msg.hasAttachments || looksLikeMedia)) {
           console.log(`[alfred] querying chat.db for attachments (rowId: ${msg.rowId}, hasAttachments=${msg.hasAttachments}, looksLikeMedia=${looksLikeMedia})`);
-          const resolved = await resolveAttachment(msg.rowId);
-          if (resolved) {
-            attachmentPath = resolved.localPath;
-            attachmentMime = resolved.mimeType;
-            const mime = attachmentMime.toLowerCase();
-            const p = attachmentPath.toLowerCase();
-            if (mime.startsWith("audio/") || /\.(caf|m4a|mp3)$/.test(p)) type = "audio";
-            else if (mime.startsWith("image/") || /\.(jpg|jpeg|png|gif|heic|heif|webp)$/.test(p)) type = "image";
-            else type = "file";
-          }
+          allAttachments = await resolveAttachments(msg.rowId);
         }
 
-        if (attachmentPath) {
-          console.log(`[alfred] attachment: type=${type} path=${attachmentPath} mime=${attachmentMime}`);
+        // Classify by first attachment's type (audio/image/file are mutually exclusive per message)
+        if (allAttachments.length > 0) {
+          const mime = allAttachments[0].mimeType.toLowerCase();
+          const p = allAttachments[0].localPath.toLowerCase();
+          if (mime.startsWith("audio/") || /\.(caf|m4a|mp3)$/.test(p)) type = "audio";
+          else if (mime.startsWith("image/") || /\.(jpg|jpeg|png|gif|heic|heif|webp)$/.test(p)) type = "image";
+          else type = "file";
+          console.log(`[alfred] ${allAttachments.length} attachment(s): type=${type}`);
         }
 
         // Handle attachments
-        if (type === "audio" && attachmentPath) {
-          transcript = (await transcribeAudio(attachmentPath)) ?? undefined;
-        } else if (type === "image" && attachmentPath) {
-          fileSummary = (await summarizeImageFromPath(attachmentPath)) ?? undefined;
-        } else if (type === "file" && attachmentPath) {
-          fileSummary = (await summarizeFile(attachmentPath)) ?? undefined;
+        if (type === "audio" && allAttachments.length > 0) {
+          transcript = (await transcribeAudio(allAttachments[0].localPath)) ?? undefined;
+        } else if (type === "image" && allAttachments.length > 0) {
+          const imagePaths = allAttachments
+            .filter(({ localPath: p }) => /\.(jpg|jpeg|png|gif|heic|heif|webp)$/i.test(p) || allAttachments[0].mimeType.startsWith("image/"))
+            .map((a) => a.localPath);
+          const summaries = await Promise.all(imagePaths.map((p) => summarizeImageFromPath(p)));
+          const valid = summaries.filter(Boolean) as string[];
+          fileSummary = valid.length === 1
+            ? valid[0]
+            : valid.map((s, i) => `[Image ${i + 1}: ${s}]`).join(" ");
+        } else if (type === "file" && allAttachments.length > 0) {
+          fileSummary = (await summarizeFile(allAttachments[0].localPath)) ?? undefined;
         }
 
         // Store raw message

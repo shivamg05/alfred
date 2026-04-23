@@ -16,7 +16,7 @@ async function heicToJpegBuffer(inputBuf: Buffer): Promise<Buffer | null> {
   try {
     const heicConvert = (await import("heic-convert")).default;
     const outputBuf = await heicConvert({
-      buffer: inputBuf.buffer.slice(inputBuf.byteOffset, inputBuf.byteOffset + inputBuf.byteLength) as ArrayBuffer,
+      buffer: inputBuf as unknown as ArrayBuffer,
       format: "JPEG",
       quality: 0.85,
     });

@@ -1,9 +1,8 @@
 import { execSync } from "child_process";
-import { createReadStream, unlinkSync, existsSync } from "fs";
+import { readFileSync, unlinkSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { makeOpenAIClient } from "../orchestrator/llm.js";
-import { config } from "../config.js";
 
 export async function transcribeAudio(filePath: string): Promise<string | null> {
   // Use macOS built-in afconvert to produce a 16kHz mono WAV — no ffmpeg needed.
@@ -19,19 +18,30 @@ export async function transcribeAudio(filePath: string): Promise<string | null> 
     return null;
   }
 
-  // Whisper model ID — OpenRouter proxies it as "openai/whisper-1"
-  const cfg = config();
-  const model = cfg.LLM_BASE_URL ? "openai/whisper-1" : "whisper-1";
-
   try {
-    const result = await makeOpenAIClient().audio.transcriptions.create({
-      file: createReadStream(tmpWav),
-      model,
+    const audioBase64 = readFileSync(tmpWav).toString("base64");
+
+    const response = await makeOpenAIClient().chat.completions.create({
+      model: "google/gemini-2.5-flash-lite",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Transcribe this audio exactly. Output only the spoken words, nothing else." },
+            { type: "input_audio", input_audio: { data: audioBase64, format: "wav" } },
+          ] as never,
+        },
+      ],
+      max_tokens: 500,
+      temperature: 0,
     });
-    console.log(`[transcription] transcript: "${result.text.slice(0, 100)}"`);
-    return result.text;
+
+    const text = response.choices[0]?.message?.content?.trim() ?? "";
+    if (!text) return null;
+    console.log(`[transcription] transcript: "${text.slice(0, 100)}"`);
+    return text;
   } catch (err) {
-    console.error("[transcription] Whisper API failed:", err);
+    console.error("[transcription] transcription failed:", err);
     return null;
   } finally {
     if (existsSync(tmpWav)) unlinkSync(tmpWav);
