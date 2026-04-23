@@ -28,9 +28,20 @@ export function llmClient(): OpenAI {
  * web, read URLs, and manage Todoist tasks mid-response before sending its
  * final reply.
  */
+const WEB_TOOLS = new Set(["search_web", "scrape_url"]);
+export const SEARCH_ACKS = [
+  "lemme look into this",
+  "one sec, looking it up",
+  "give me a sec",
+  "hold on lemme check",
+  "looking it up rn",
+  "ya let me check",
+];
+
 export async function chat(
   systemPrompt: string,
   userMessage: string,
+  onWebSearch?: () => Promise<void>,
 ): Promise<string> {
   const tools = getTools();
 
@@ -40,6 +51,7 @@ export async function chat(
   ];
 
   const MAX_ITERATIONS = 8; // enough for list + N mutations or multi-step web research
+  let webAckFired = false;
 
   for (let i = 0; i < MAX_ITERATIONS; i++) {
     const tIter = Date.now();
@@ -61,6 +73,12 @@ export async function chat(
     }
 
     console.log(`[llm] iter ${i + 1} (${msg.tool_calls.length} tool calls) ${Date.now() - tIter}ms`);
+
+    // Fire ack before first web tool call so user knows Alfred is searching
+    if (!webAckFired && onWebSearch && msg.tool_calls.some((c) => c.type === "function" && WEB_TOOLS.has(c.function.name))) {
+      webAckFired = true;
+      onWebSearch().catch(() => {});
+    }
 
     // Execute all tool calls in this turn (may be parallel)
     await Promise.all(

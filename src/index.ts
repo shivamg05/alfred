@@ -16,7 +16,7 @@ import { classifyMessage, getEffectiveText } from "./ingestion/router.js";
 import { transcribeAudio } from "./ingestion/transcription.js";
 import { summarizeImageFromPath, summarizeFile } from "./ingestion/fileParser.js";
 import { fetchContext, buildPrompt } from "./orchestrator/context.js";
-import { chat } from "./orchestrator/llm.js";
+import { chat, SEARCH_ACKS } from "./orchestrator/llm.js";
 import { classifyWithTimeout } from "./orchestrator/classifier.js";
 import { sendBubbles } from "./orchestrator/response.js";
 import { checkDueReminders, registerCronJobs } from "./proactive/engine.js";
@@ -71,6 +71,7 @@ const RESPONSE_DEBOUNCE_MS = 1000;
 interface PendingResponse {
   text: string;
   modePromise: Promise<ResponseMode>;
+  receivedAt: number;
 }
 
 async function main(): Promise<void> {
@@ -116,6 +117,7 @@ async function main(): Promise<void> {
     const combinedText = batch.map((m) => m.text).join("\n");
 
     // Resolve classifier + retrieval in parallel
+    const wallStart = batch[0].receivedAt;
     const t0 = Date.now();
     const [modes, contextData] = await Promise.all([
       Promise.all(batch.map((m) => m.modePromise)),
@@ -126,26 +128,31 @@ async function main(): Promise<void> {
     const mode: ResponseMode =
       modes.some((m) => m === "full") ? "full" :
       modes.some((m) => m === "brief") ? "brief" :
+      modes.some((m) => m === "acknowledge") ? "acknowledge" :
       "silent";
 
     console.log(`[alfred] responding to ${batch.length} message(s) as ${mode}`);
 
-    if (mode === "silent") {
-      if (Math.random() < 0.3) {
-        const acks = ["👍", "👀", "ok", "gotcha"];
-        await sendBubbles(sdk, acks[Math.floor(Math.random() * acks.length)]);
-      }
+    if (mode === "silent") return;
+
+    if (mode === "acknowledge") {
+      const acks = ["noted", "got it", "heard", "on it", "👍", "👀", "noted 👍", "yep noted", "i hear you", "got it 👍"];
+      await sendBubbles(sdk, acks[Math.floor(Math.random() * acks.length)]);
       return;
     }
 
     try {
       const systemPrompt = buildPrompt(contextData, mode);
       const tContext = Date.now();
-      const reply = await chat(systemPrompt, combinedText);
+      const reply = await chat(systemPrompt, combinedText, async () => {
+        const ack = SEARCH_ACKS[Math.floor(Math.random() * SEARCH_ACKS.length)];
+        console.log(`[alfred] web search ack: "${ack}"`);
+        await sendBubbles(sdk, ack);
+      });
       const tLLM = Date.now();
       await sendBubbles(sdk, reply);
       const tSend = Date.now();
-      console.log(`[alfred] timings — classify+context:${tContext - t0}ms llm:${tLLM - tContext}ms send:${tSend - tLLM}ms total:${tSend - t0}ms`);
+      console.log(`[alfred] timings — classify+context:${tContext - t0}ms llm:${tLLM - tContext}ms send:${tSend - tLLM}ms total:${tSend - t0}ms wall:${tSend - wallStart}ms`);
       console.log("[alfred] reply:", reply);
 
       buffer.push({
@@ -158,8 +165,8 @@ async function main(): Promise<void> {
     }
   }
 
-  function scheduleResponse(text: string, modePromise: Promise<ResponseMode>): void {
-    pendingResponses.push({ text, modePromise });
+  function scheduleResponse(text: string, modePromise: Promise<ResponseMode>, receivedAt: number): void {
+    pendingResponses.push({ text, modePromise, receivedAt });
     if (responseTimer) clearTimeout(responseTimer);
     responseTimer = setTimeout(() => {
       flushResponseBuffer().catch((err) =>
@@ -251,6 +258,8 @@ async function main(): Promise<void> {
           timestamp: new Date().toISOString(),
         });
 
+        const receivedAt = Date.now();
+
         // Fire classifier immediately (non-blocking) — runs in parallel with retrieval
         const modePromise: Promise<ResponseMode> = (transcript || fileSummary)
           ? Promise.resolve("full" as const)
@@ -258,7 +267,7 @@ async function main(): Promise<void> {
 
         // Queue for debounced response — resets timer if user sends another
         // message within RESPONSE_DEBOUNCE_MS (simulates typing detection)
-        scheduleResponse(effectiveText, modePromise);
+        scheduleResponse(effectiveText, modePromise, receivedAt);
 
         // Fire any due reminders triggered by this message
         checkDueReminders(sdk);

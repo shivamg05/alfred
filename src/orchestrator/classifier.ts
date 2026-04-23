@@ -2,10 +2,10 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { llmClient } from "./llm.js";
 
-export type ResponseMode = "silent" | "brief" | "full";
+export type ResponseMode = "silent" | "acknowledge" | "brief" | "full";
 
 const schema = z.object({
-  mode: z.enum(["silent", "brief", "full"]),
+  mode: z.enum(["silent", "acknowledge", "brief", "full"]),
 });
 
 /** Extract the JSON object from a string, ignoring fences and trailing explanation text. */
@@ -16,20 +16,23 @@ function extractJSON(s: string): string {
   return s.trim();
 }
 
-const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "brief" | "full" }
+const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "acknowledge" | "brief" | "full" }
 
-BIAS HARD toward silent and brief. Most messages don't need a full response.
+bias toward silent and acknowledge. Most messages don't need a full response.
 
-silent — logging, venting, info dump, no question asked, short reactions ("lol", "fr", "damn", "ok", "yeah", "nice")
-  → "my summer is split into 3 tracks" / "woke up at 7" / "lol fr" / "ya true" / "deadass" / "bet"
+silent — pure reactions, nothing to confirm, no action taken ("lol", "fr", "damn", "ok", "yeah", "nice", "bet", "deadass")
+  → "lol fr" / "ya true" / "deadass" / "woke up at 7" (pure info dump, no action needed)
 
-brief — worth a quick take but not a full conversation. One sentence.
+acknowledge — user wants to feel heard or confirmed, but doesn't want conversation. Action was implicit (reminder set, note taken) or they're sharing something heavy without asking for engagement.
+  → "remind me to call mom tomorrow" / "note that i have a meeting at 3" / "i'm so tired of this" / "just finished a 10 mile run" / "my summer is split into 3 tracks" / "i don't wanna talk about it"
+
+brief — worth a quick take or reaction, not just confirmation. One sentence opinion or observation.
   → "kinda nervous about tomorrow" / "just finished the project" / "might apply to that fellowship" / "thinking about X"
 
 full — explicit question, request for help, or asking for Alfred's opinion on something specific.
   → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?"
 
-Default to brief if unsure. Only pick full if they clearly want a response.`;
+Default to acknowledge if unsure. Only pick full if they clearly want a response.`;
 
 export async function classifyWithTimeout(
   userMessage: string,
@@ -52,7 +55,7 @@ export async function classifyIntent(
   const t0 = Date.now();
   try {
     const response = await llmClient().chat.completions.create({
-      model: config().EXTRACTION_MODEL,
+      model: "google/gemini-2.5-flash-lite",
       messages: [
         { role: "system", content: PROMPT },
         { role: "user", content: userMessage },
