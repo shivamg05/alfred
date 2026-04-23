@@ -261,9 +261,14 @@ async function main(): Promise<void> {
         const receivedAt = Date.now();
 
         // Fire classifier immediately (non-blocking) — runs in parallel with retrieval
+        // Pass last 3 messages so classifier understands follow-ups and continuations
+        const recentForClassifier = buffer.getRecent(5).map((m) => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        }));
         const modePromise: Promise<ResponseMode> = (transcript || fileSummary)
           ? Promise.resolve("full" as const)
-          : classifyWithTimeout(effectiveText);
+          : classifyWithTimeout(effectiveText, recentForClassifier);
 
         // Queue for debounced response — resets timer if user sends another
         // message within RESPONSE_DEBOUNCE_MS (simulates typing detection)

@@ -34,30 +34,45 @@ full — explicit question, request for help, or asking for Alfred's opinion on 
 
 Default to acknowledge if unsure. Only pick full if they clearly want a response.`;
 
+export interface ClassifierMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export async function classifyWithTimeout(
   userMessage: string,
+  recentMessages: ClassifierMessage[] = [],
   timeoutMs = 5000,
 ): Promise<ResponseMode> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<ResponseMode>((resolve) => {
+    timer = setTimeout(() => {
+      console.log(`[classifier] timeout after ${timeoutMs}ms → brief`);
+      resolve("brief");
+    }, timeoutMs);
+  });
   return Promise.race([
-    classifyIntent(userMessage),
-    new Promise<ResponseMode>((resolve) =>
-      setTimeout(() => {
-        console.log(`[classifier] timeout after ${timeoutMs}ms → brief`);
-        resolve("brief");
-      }, timeoutMs),
-    ),
+    classifyIntent(userMessage, recentMessages).finally(() => clearTimeout(timer)),
+    timeout,
   ]);
 }
 
 export async function classifyIntent(
   userMessage: string,
+  recentMessages: ClassifierMessage[] = [],
 ): Promise<ResponseMode> {
   const t0 = Date.now();
+
+  // Build context string from recent conversation so classifier understands follow-ups
+  const contextBlock = recentMessages.length > 0
+    ? `\nRECENT CONVERSATION (for context only):\n${recentMessages.map((m) => `${m.role === "assistant" ? "alfred" : "them"}: ${m.content}`).join("\n")}\n`
+    : "";
+
   try {
     const response = await llmClient().chat.completions.create({
       model: "google/gemini-2.5-flash-lite",
       messages: [
-        { role: "system", content: PROMPT },
+        { role: "system", content: PROMPT + contextBlock },
         { role: "user", content: userMessage },
       ],
       max_tokens: 60,

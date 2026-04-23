@@ -289,7 +289,7 @@ export async function extractFromMessage(opts: {
     // Catches cases where the LLM rephrases an existing fact rather than skipping it.
     try {
       const nearby = await querySimilarFacts(fact.text, 1);
-      if (nearby.length > 0 && nearby[0].distance < 0.15) {
+      if (nearby.length > 0 && nearby[0].distance < 0.2) {
         console.log(`[extractor] skip near-duplicate (dist=${nearby[0].distance.toFixed(3)}): "${fact.text.slice(0, 60)}" ≈ "${nearby[0].text.slice(0, 60)}"`);
         continue;
       }
