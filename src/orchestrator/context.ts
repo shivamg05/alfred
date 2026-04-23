@@ -20,10 +20,14 @@ async function getTaskContext(): Promise<string> {
   return _cachedTasksStr;
 }
 
-export async function buildContext(
-  buffer: ConversationBuffer,
-  mode: ResponseMode = "full",
-): Promise<string> {
+export interface ContextData {
+  memoryContext: Awaited<ReturnType<typeof retrieveContext>>;
+  recentMessages: ReturnType<ConversationBuffer["getRecent"]>;
+  todoistTasks: string;
+}
+
+/** Retrieval only — mode-independent. Safe to run in parallel with classifyIntent. */
+export async function fetchContext(buffer: ConversationBuffer): Promise<ContextData> {
   const recentMessages = buffer.getRecent(20);
   const latestUserMsg =
     recentMessages.filter((m) => m.role === "user").at(-1)?.content ?? "";
@@ -33,5 +37,23 @@ export async function buildContext(
     getTaskContext(),
   ]);
 
-  return buildSystemPrompt(memoryContext, recentMessages, todoistTasks, mode);
+  return { memoryContext, recentMessages, todoistTasks };
+}
+
+/** Assembles the final system prompt once mode is known. */
+export function buildPrompt(data: ContextData, mode: ResponseMode): string {
+  console.log(
+    `[context] mode=${mode} history=${data.recentMessages.length}msgs ` +
+    `bedrock=${data.memoryContext.bedrock.length} retrieved=${data.memoryContext.retrieved.length} ` +
+    `todoist=${data.todoistTasks ? "yes" : "no"}`,
+  );
+  return buildSystemPrompt(data.memoryContext, data.recentMessages, data.todoistTasks, mode);
+}
+
+/** Convenience wrapper (keeps existing callers working). */
+export async function buildContext(
+  buffer: ConversationBuffer,
+  mode: ResponseMode = "full",
+): Promise<string> {
+  return buildPrompt(await fetchContext(buffer), mode);
 }

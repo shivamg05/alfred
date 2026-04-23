@@ -8,9 +8,12 @@ const schema = z.object({
   mode: z.enum(["silent", "brief", "full"]),
 });
 
-/** Strip markdown code fences in case the model wraps its JSON output */
-function stripFences(s: string): string {
-  return s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+/** Extract the JSON object from a string, ignoring fences and trailing explanation text. */
+function extractJSON(s: string): string {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) return s.slice(start, end + 1);
+  return s.trim();
 }
 
 const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "brief" | "full" }
@@ -28,9 +31,25 @@ full — explicit question, request for help, or asking for Alfred's opinion on 
 
 Default to brief if unsure. Only pick full if they clearly want a response.`;
 
+export async function classifyWithTimeout(
+  userMessage: string,
+  timeoutMs = 5000,
+): Promise<ResponseMode> {
+  return Promise.race([
+    classifyIntent(userMessage),
+    new Promise<ResponseMode>((resolve) =>
+      setTimeout(() => {
+        console.log(`[classifier] timeout after ${timeoutMs}ms → brief`);
+        resolve("brief");
+      }, timeoutMs),
+    ),
+  ]);
+}
+
 export async function classifyIntent(
   userMessage: string,
 ): Promise<ResponseMode> {
+  const t0 = Date.now();
   try {
     const response = await llmClient().chat.completions.create({
       model: config().EXTRACTION_MODEL,
@@ -43,9 +62,12 @@ export async function classifyIntent(
     });
 
     const raw = response.choices[0]?.message?.content ?? '{"mode":"brief"}';
-    const parsed = schema.safeParse(JSON.parse(stripFences(raw)));
-    return parsed.success ? parsed.data.mode : "brief";
+    const parsed = schema.safeParse(JSON.parse(extractJSON(raw)));
+    const mode = parsed.success ? parsed.data.mode : "brief";
+    console.log(`[classifier] ${mode} (${Date.now() - t0}ms)`);
+    return mode;
   } catch {
-    return "brief"; // fail to brief, not full
+    console.log(`[classifier] failed → brief (${Date.now() - t0}ms)`);
+    return "brief";
   }
 }

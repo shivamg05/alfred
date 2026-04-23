@@ -1,20 +1,15 @@
 import { ChromaClient, Collection, EmbeddingFunction } from "chromadb";
 import OpenAI from "openai";
 import { config } from "../config.js";
+import { makeOpenAIClient } from "../orchestrator/llm.js";
 
 // Use OpenAI embeddings directly so ChromaDB doesn't try to load its default embed package.
-// If LLM_BASE_URL is set (e.g. OpenRouter), route embeddings through it too — the key is
-// an OpenRouter key and won't work against api.openai.com directly.
-// OpenRouter supports text-embedding-3-small at openai/text-embedding-3-small.
+// Routes through LLM_BASE_URL (OpenRouter) when set, with proper headers.
 class OpenAIEmbeddings implements EmbeddingFunction {
   private client: OpenAI;
 
   constructor() {
-    const cfg = config();
-    this.client = new OpenAI({
-      apiKey: cfg.OPENAI_API_KEY,
-      ...(cfg.LLM_BASE_URL ? { baseURL: cfg.LLM_BASE_URL } : {}),
-    });
+    this.client = makeOpenAIClient();
   }
 
   async generate(texts: string[]): Promise<number[][]> {
@@ -62,6 +57,61 @@ export async function upsertFact(factId: number, text: string, metadata: Record<
     metadatas: [metadata],
   });
   return id;
+}
+
+/**
+ * On startup: find any facts with chroma_id IS NULL and embed them.
+ * These exist when ChromaDB was down during extraction — facts were saved to
+ * SQLite but the embedding call failed silently.
+ */
+export async function embedUnindexedFacts(): Promise<void> {
+  const { db } = await import("../db/schema.js");
+  const { config: cfg } = await import("../config.js");
+  const userId = cfg().USER_ID;
+
+  const unindexed = db()
+    .prepare(
+      `SELECT id, text, is_static, document_date, event_date
+       FROM memory_facts
+       WHERE user_id = ? AND is_latest = 1 AND is_forgotten = 0
+         AND (chroma_id IS NULL OR chroma_id = '')
+       ORDER BY id ASC`,
+    )
+    .all(userId) as Array<{
+      id: number; text: string; is_static: number;
+      document_date: string; event_date: string | null;
+    }>;
+
+  if (unindexed.length === 0) return;
+  console.log(`[vectors] embedding ${unindexed.length} unindexed fact(s)...`);
+
+  const collection = await factsCollection();
+  const BATCH = 20;
+
+  for (let i = 0; i < unindexed.length; i += BATCH) {
+    const batch = unindexed.slice(i, i + BATCH);
+    try {
+      const embeddings = await embedder().generate(batch.map((f) => f.text));
+      await collection.upsert({
+        ids: batch.map((f) => `fact_${f.id}`),
+        embeddings,
+        documents: batch.map((f) => f.text),
+        metadatas: batch.map((f) => ({
+          is_static: f.is_static === 1,
+          document_date: f.document_date,
+          user_id: userId,
+          ...(f.event_date ? { event_date: f.event_date } : {}),
+        })),
+      });
+      for (const f of batch) {
+        db().prepare("UPDATE memory_facts SET chroma_id = ? WHERE id = ?")
+          .run(`fact_${f.id}`, f.id);
+      }
+      console.log(`[vectors] indexed facts ${batch[0].id}–${batch[batch.length - 1].id}`);
+    } catch (err) {
+      console.error(`[vectors] batch embed failed:`, err);
+    }
+  }
 }
 
 export interface SemanticHit {

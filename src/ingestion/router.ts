@@ -22,9 +22,10 @@ export function classifyMessage(msg: Message): MessageType {
 }
 
 export function getEffectiveText(msg: Message, transcript?: string, fileSummary?: string): string {
-  const type = classifyMessage(msg);
-  if (type === "text") return msg.text ?? "";
-  if (type === "audio" && transcript) return `[voice message]: ${transcript}`;
-  if ((type === "image" || type === "file") && fileSummary) return `[attachment]: ${fileSummary}`;
-  return msg.text ?? "[unsupported attachment]";
+  // Strip iMessage's object-replacement character (attachment placeholder)
+  const cleanText = (msg.text ?? "").replace(/\uFFFC/g, "").trim();
+
+  if (transcript) return `[voice message]: ${transcript}`;
+  if (fileSummary) return cleanText ? `${cleanText}\n[image: ${fileSummary}]` : `[image: ${fileSummary}]`;
+  return cleanText || "[unsupported attachment]";
 }

@@ -8,7 +8,9 @@ const schema = z.object({
 
   // AI
   OPENAI_API_KEY: z.string().min(1),
-  LLM_BASE_URL: z.string().url().optional(),  // for openai-compatible providers (gemini, groq, etc.)
+  LLM_BASE_URL: z.string().url().optional(),  // for openai-compatible providers (openrouter, etc.)
+  OPENROUTER_SITE_URL: z.string().optional(), // shown on openrouter.ai rankings (optional)
+  OPENROUTER_SITE_NAME: z.string().optional(), // shown on openrouter.ai rankings (optional)
   LLM_MODEL: z.string().default("gpt-4o-mini"),
   EXTRACTION_MODEL: z.string().default("gpt-4o-mini"),
 

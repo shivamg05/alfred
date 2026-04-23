@@ -2,15 +2,24 @@ import OpenAI from "openai";
 import { config } from "../config.js";
 import { getTools, executeTool } from "../tools/registry.js";
 
+/** Build an OpenAI-compatible client, with OpenRouter headers when applicable. */
+export function makeOpenAIClient(): OpenAI {
+  const cfg = config();
+  const defaultHeaders: Record<string, string> = {};
+  if (cfg.LLM_BASE_URL?.includes("openrouter")) {
+    if (cfg.OPENROUTER_SITE_URL) defaultHeaders["HTTP-Referer"] = cfg.OPENROUTER_SITE_URL;
+    if (cfg.OPENROUTER_SITE_NAME) defaultHeaders["X-Title"] = cfg.OPENROUTER_SITE_NAME;
+  }
+  return new OpenAI({
+    apiKey: cfg.OPENAI_API_KEY,
+    ...(cfg.LLM_BASE_URL ? { baseURL: cfg.LLM_BASE_URL } : {}),
+    ...(Object.keys(defaultHeaders).length ? { defaultHeaders } : {}),
+  });
+}
+
 let _client: OpenAI | null = null;
 export function llmClient(): OpenAI {
-  if (!_client) {
-    const cfg = config();
-    _client = new OpenAI({
-      apiKey: cfg.OPENAI_API_KEY,
-      ...(cfg.LLM_BASE_URL ? { baseURL: cfg.LLM_BASE_URL } : {}),
-    });
-  }
+  if (!_client) _client = makeOpenAIClient();
   return _client;
 }
 
@@ -33,6 +42,7 @@ export async function chat(
   const MAX_ITERATIONS = 8; // enough for list + N mutations or multi-step web research
 
   for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const tIter = Date.now();
     const response = await llmClient().chat.completions.create({
       model: config().LLM_MODEL,
       messages,
@@ -46,8 +56,11 @@ export async function chat(
 
     // No tool calls — this is the final text response
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      console.log(`[llm] iter ${i + 1} (final) ${Date.now() - tIter}ms`);
       return msg.content?.trim() ?? "...";
     }
+
+    console.log(`[llm] iter ${i + 1} (${msg.tool_calls.length} tool calls) ${Date.now() - tIter}ms`);
 
     // Execute all tool calls in this turn (may be parallel)
     await Promise.all(
@@ -55,7 +68,9 @@ export async function chat(
         .filter((call) => call.type === "function")
         .map(async (call) => {
           const args = JSON.parse(call.function.arguments) as Record<string, string>;
+          const tTool = Date.now();
           const result = await executeTool(call.function.name, args);
+          console.log(`[llm] tool ${call.function.name} ${Date.now() - tTool}ms`);
           messages.push({
             role: "tool",
             tool_call_id: call.id,

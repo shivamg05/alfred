@@ -5,11 +5,14 @@ export interface MemoryFact {
   id: number;
   text: string;
   is_static: boolean;
+  is_latest: boolean;
+  is_forgotten: boolean;
   document_date: string;
   event_date?: string;
   forget_after?: string;
   chroma_id?: string;
   source_message_id?: number;
+  edge_count?: number;
 }
 
 export interface Reminder {
@@ -60,13 +63,74 @@ export function markSuperseded(factId: number): void {
 export function insertRelation(
   factIdA: number,
   factIdB: number,
-  relationType: "updates" | "extends" | "derives",
+  relationType: "updates" | "extends" | "derives" | "relates_to",
 ): void {
+  // Canonical ordering: always store lower ID as fact_id_a so (A,B) and (B,A)
+  // collapse to the same row and the UNIQUE constraint prevents duplicates.
+  const [a, b] = factIdA < factIdB ? [factIdA, factIdB] : [factIdB, factIdA];
   db()
     .prepare(
-      "INSERT INTO fact_relations (fact_id_a, fact_id_b, relation_type) VALUES (?, ?, ?)",
+      "INSERT OR IGNORE INTO fact_relations (fact_id_a, fact_id_b, relation_type) VALUES (?, ?, ?)",
     )
-    .run(factIdA, factIdB, relationType);
+    .run(a, b, relationType);
+}
+
+/**
+ * Return the IDs of facts connected to this one via 'relates_to' edges.
+ * Checks both directions since edges are stored directionally.
+ */
+export function getRelatedFactIds(factId: number): number[] {
+  const rows = db()
+    .prepare(
+      `SELECT CASE WHEN fact_id_a = ? THEN fact_id_b ELSE fact_id_a END AS related_id
+       FROM fact_relations
+       WHERE (fact_id_a = ? OR fact_id_b = ?) AND relation_type = 'relates_to'
+       LIMIT 20`,
+    )
+    .all(factId, factId, factId) as { related_id: number }[];
+  return rows.map((r) => r.related_id);
+}
+
+/**
+ * The bedrock: 5 oldest static facts. These are the first things the user
+ * told Alfred about themselves and tend to be the most foundational identity
+ * facts (name, school, job, location). Always injected regardless of query.
+ */
+/**
+ * The bedrock: 5 static facts with the most graph connections.
+ * High-degree nodes are the most central facts in the knowledge graph —
+ * they're referenced by many other facts, making them definitionally core.
+ * Falls back to oldest static facts if no edges exist yet (cold start).
+ */
+/**
+ * The bedrock: 5 most structurally central facts regardless of static/dynamic.
+ * Ranks by edge_count but applies a recency penalty so transient clusters
+ * (e.g. a single soccer-game conversation that produced many edges today) don't
+ * dominate over facts that have accumulated connections over weeks.
+ *
+ * Score = edge_count / (1 + age_days * 0.05)
+ * A fact with 4 edges from today scores the same as a fact with 4 edges from
+ * 20 days ago — but a fact with 4 edges from 6 months ago scores ~half.
+ */
+export function getBedrockFacts(): MemoryFact[] {
+  return db()
+    .prepare(
+      `SELECT mf.id, mf.text, mf.is_static, mf.is_latest, mf.is_forgotten,
+              mf.document_date, mf.event_date, mf.forget_after, mf.chroma_id, mf.source_message_id,
+              COUNT(fr.id) AS edge_count,
+              CAST(julianday('now') - julianday(mf.created_at) AS REAL) AS age_days
+       FROM memory_facts mf
+       LEFT JOIN fact_relations fr
+         ON (fr.fact_id_a = mf.id OR fr.fact_id_b = mf.id)
+       WHERE mf.user_id = ? AND mf.is_latest = 1 AND mf.is_forgotten = 0
+       GROUP BY mf.id
+       ORDER BY
+         CAST(COUNT(fr.id) AS REAL) / (1.0 + (julianday('now') - julianday(mf.created_at)) * 0.05) DESC,
+         mf.is_static DESC,
+         mf.created_at ASC
+       LIMIT 5`,
+    )
+    .all(config().USER_ID) as MemoryFact[];
 }
 
 export function insertReminder(reminder: {
@@ -116,7 +180,11 @@ export function getActiveDynamicFacts(): MemoryFact[] {
        FROM memory_facts
        WHERE user_id = ? AND is_static = 0 AND is_latest = 1 AND is_forgotten = 0
          AND (forget_after IS NULL OR forget_after > datetime('now'))
-       ORDER BY created_at DESC LIMIT 30`,
+       ORDER BY
+         CASE WHEN event_date IS NOT NULL AND event_date > datetime('now') THEN 0 ELSE 1 END ASC,
+         event_date ASC,
+         created_at DESC
+       LIMIT 30`,
     )
     .all(config().USER_ID) as MemoryFact[];
 }
@@ -124,7 +192,7 @@ export function getActiveDynamicFacts(): MemoryFact[] {
 export function getFactById(id: number): MemoryFact | undefined {
   return db()
     .prepare(
-      `SELECT id, text, is_static, document_date, event_date, forget_after, chroma_id, source_message_id
+      `SELECT id, text, is_static, is_latest, is_forgotten, document_date, event_date, forget_after, chroma_id, source_message_id
        FROM memory_facts WHERE id = ?`,
     )
     .get(id) as MemoryFact | undefined;

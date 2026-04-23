@@ -85,6 +85,9 @@ function applySchema(db: Database.Database): void {
       sent_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE INDEX IF NOT EXISTS idx_fact_relations_a ON fact_relations(fact_id_a, relation_type);
+    CREATE INDEX IF NOT EXISTS idx_fact_relations_b ON fact_relations(fact_id_b, relation_type);
+
     -- FTS5 for BM25 keyword search alongside ChromaDB semantic search
     CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts
       USING fts5(text, content='memory_facts', content_rowid='id', tokenize='unicode61');
@@ -105,4 +108,40 @@ function applySchema(db: Database.Database): void {
         INSERT INTO memory_facts_fts(memory_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
       END;
   `);
+
+  // v1 migration: recreate fact_relations without the CHECK constraint so
+  // 'relates_to' (knowledge graph edges) can be stored alongside 'updates'.
+  const schemaVersion = (db.pragma("user_version", { simple: true }) as number) ?? 0;
+  if (schemaVersion < 1) {
+    db.exec(`
+      DROP TABLE IF EXISTS fact_relations;
+      CREATE TABLE fact_relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact_id_a INTEGER NOT NULL REFERENCES memory_facts(id),
+        fact_id_b INTEGER NOT NULL REFERENCES memory_facts(id),
+        relation_type TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(fact_id_a, fact_id_b, relation_type)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fact_relations_a ON fact_relations(fact_id_a, relation_type);
+      CREATE INDEX IF NOT EXISTS idx_fact_relations_b ON fact_relations(fact_id_b, relation_type);
+    `);
+    db.pragma("user_version = 1");
+  }
+
+  if (schemaVersion < 2) {
+    // Deduplicate fact_relations: collapse (A,B) and (B,A) into canonical (min,max) form.
+    db.exec(`
+      DELETE FROM fact_relations
+      WHERE id NOT IN (
+        SELECT MIN(id) FROM fact_relations
+        GROUP BY MIN(fact_id_a, fact_id_b), MAX(fact_id_a, fact_id_b), relation_type
+      );
+      UPDATE fact_relations
+      SET fact_id_a = MIN(fact_id_a, fact_id_b),
+          fact_id_b = MAX(fact_id_a, fact_id_b)
+      WHERE fact_id_a > fact_id_b;
+    `);
+    db.pragma("user_version = 2");
+  }
 }

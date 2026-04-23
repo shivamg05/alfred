@@ -48,8 +48,8 @@ export function registerCronJobs(sdk: IMessageSDK): void {
   cron.schedule("0 13 * * *", async () => {
     const systemPrompt = await makeProactiveSystemPrompt();
     const ctx = await retrieveContext("something interesting from the past worth remembering");
-    if (ctx.relevantFacts.length === 0) return;
-    const trigger = `surface one connection from the past that might be interesting to bring up: "${ctx.relevantFacts[0]}"`;
+    if (ctx.retrieved.length === 0) return;
+    const trigger = `surface one connection from the past that might be interesting to bring up: "${ctx.retrieved[0]}"`;
     const msg = await generateProactive(systemPrompt, trigger);
     if (shouldSendProactive(msg)) {
       await sendBubbles(sdk, msg);

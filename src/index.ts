@@ -14,17 +14,18 @@ import { insertMessage, getRecentMessages } from "./memory/facts.js";
 import { extractFromMessage } from "./memory/extractor.js";
 import { classifyMessage, getEffectiveText } from "./ingestion/router.js";
 import { transcribeAudio } from "./ingestion/transcription.js";
-import { summarizeImage, summarizeFile } from "./ingestion/fileParser.js";
-import { buildContext } from "./orchestrator/context.js";
+import { summarizeImageFromPath, summarizeFile } from "./ingestion/fileParser.js";
+import { fetchContext, buildPrompt } from "./orchestrator/context.js";
 import { chat } from "./orchestrator/llm.js";
-import { classifyIntent } from "./orchestrator/classifier.js";
+import { classifyWithTimeout } from "./orchestrator/classifier.js";
 import { sendBubbles } from "./orchestrator/response.js";
 import { checkDueReminders, registerCronJobs } from "./proactive/engine.js";
+import { resolveAttachment } from "./ingestion/attachments.js";
+import { embedUnindexedFacts } from "./memory/vectors.js";
+import type { ResponseMode } from "./orchestrator/classifier.js";
 
 // ---------------------------------------------------------------------------
 // Session buffer — batches messages before extraction for richer context
-// (Supermemory insight: extracting from a session gives better coreference
-//  resolution and more contextual facts than per-message extraction)
 // ---------------------------------------------------------------------------
 const SESSION_MAX = 5;                   // flush after this many messages
 const SESSION_IDLE_MS = 2 * 60 * 1000;  // or after 2 min of silence
@@ -56,6 +57,22 @@ function queueForExtraction(text: string, messageId: number): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Response debounce — simulates "wait for user to finish typing"
+//
+// iMessage has no typing-indicator API, so we approximate it: each incoming
+// message is processed immediately (stored, classified, buffered) but the LLM
+// response is deferred by RESPONSE_DEBOUNCE_MS. If another message arrives
+// within that window, it's bundled and the timer resets. When the window
+// closes, Alfred responds once to the combined batch.
+// ---------------------------------------------------------------------------
+const RESPONSE_DEBOUNCE_MS = 1000;
+
+interface PendingResponse {
+  text: string;
+  modePromise: Promise<ResponseMode>;
+}
+
 async function main(): Promise<void> {
   const cfg = config();
 
@@ -78,95 +95,172 @@ async function main(): Promise<void> {
   );
   console.log("[alfred] buffer seeded with", recent.length, "messages");
 
+  // Embed any facts that were saved without embeddings (ChromaDB was down during extraction)
+  embedUnindexedFacts().catch((err) =>
+    console.error("[alfred] startup embed failed:", err),
+  );
+
   // Register proactive cron jobs
   registerCronJobs(sdk);
   console.log("[alfred] cron jobs registered");
+
+  // --- Response debounce state (per-process, single user) ---
+  const pendingResponses: PendingResponse[] = [];
+  let responseTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function flushResponseBuffer(): Promise<void> {
+    if (pendingResponses.length === 0) return;
+    const batch = pendingResponses.splice(0);
+
+    // Combine all messages into one context string
+    const combinedText = batch.map((m) => m.text).join("\n");
+
+    // Resolve classifier + retrieval in parallel
+    const t0 = Date.now();
+    const [modes, contextData] = await Promise.all([
+      Promise.all(batch.map((m) => m.modePromise)),
+      fetchContext(buffer),
+    ]);
+
+    // Escalate to the highest-priority mode across all messages
+    const mode: ResponseMode =
+      modes.some((m) => m === "full") ? "full" :
+      modes.some((m) => m === "brief") ? "brief" :
+      "silent";
+
+    console.log(`[alfred] responding to ${batch.length} message(s) as ${mode}`);
+
+    if (mode === "silent") {
+      if (Math.random() < 0.3) {
+        const acks = ["👍", "👀", "ok", "gotcha"];
+        await sendBubbles(sdk, acks[Math.floor(Math.random() * acks.length)]);
+      }
+      return;
+    }
+
+    try {
+      const systemPrompt = buildPrompt(contextData, mode);
+      const tContext = Date.now();
+      const reply = await chat(systemPrompt, combinedText);
+      const tLLM = Date.now();
+      await sendBubbles(sdk, reply);
+      const tSend = Date.now();
+      console.log(`[alfred] timings — classify+context:${tContext - t0}ms llm:${tLLM - tContext}ms send:${tSend - tLLM}ms total:${tSend - t0}ms`);
+      console.log("[alfred] reply:", reply);
+
+      buffer.push({
+        role: "assistant",
+        content: reply.replace(/\[SPLIT\]/g, " "),
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("[alfred] response error:", err);
+    }
+  }
+
+  function scheduleResponse(text: string, modePromise: Promise<ResponseMode>): void {
+    pendingResponses.push({ text, modePromise });
+    if (responseTimer) clearTimeout(responseTimer);
+    responseTimer = setTimeout(() => {
+      flushResponseBuffer().catch((err) =>
+        console.error("[alfred] flush error:", err),
+      );
+    }, RESPONSE_DEBOUNCE_MS);
+  }
 
   // Start watching for messages
   sdk.startWatching({
     async onDirectMessage(msg: Message) {
       try {
-      // Only process messages from the user (not from Alfred itself)
-      if (msg.isFromMe) return;
+        // Only process messages from the user (not from Alfred itself)
+        if (msg.isFromMe) return;
 
-      // Skip iMessage tapback reactions (Liked/Loved/Laughed at/etc.)
-      const reactionPattern = /^(Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+[""\u201C\u201D]/i;
-      if (msg.text && reactionPattern.test(msg.text.trim())) {
-        console.log(`[alfred] skipping tapback reaction: "${msg.text.slice(0, 60)}"`);
-        return;
-      }
+        // Use SDK's reaction field (covers all tapback types reliably)
+        if (msg.reaction !== null) {
+          console.log(`[alfred] skipping reaction from ${msg.participant}`);
+          return;
+        }
 
-      console.log(`[alfred] message received from ${msg.participant ?? msg.chatId}`);
+        console.log(`[alfred] message received from ${msg.participant ?? msg.chatId}`);
 
-      let transcript: string | undefined;
-      let fileSummary: string | undefined;
-      const type = classifyMessage(msg);
+        // \ufffc is iMessage's object-replacement character — placeholder for attachments.
+        // Strip it to get the real human text (may be empty for image-only messages).
+        const ATTACH_CHAR = "\uFFFC";
+        const hasPlaceholder = msg.text?.includes(ATTACH_CHAR) ?? false;
+        const plainText = (msg.text ?? "").replace(/\uFFFC/g, "").trim();
 
-      // Handle attachments
-      const attachmentPath = msg.attachments?.[0]?.localPath ?? undefined;
-      if (type === "audio" && attachmentPath) {
-        transcript = (await transcribeAudio(attachmentPath)) ?? undefined;
-      } else if (type === "image" && attachmentPath) {
-        fileSummary = (await summarizeImage(attachmentPath)) ?? undefined;
-      } else if (type === "file" && attachmentPath) {
-        fileSummary = (await summarizeFile(attachmentPath)) ?? undefined;
-      }
+        console.log(`[alfred] msg debug: text=${JSON.stringify(msg.text?.slice(0,40))} plain="${plainText.slice(0,40)}" hasPlaceholder=${hasPlaceholder} hasAttachments=${msg.hasAttachments} attachments=${msg.attachments?.length ?? "undef"}`);
 
-      // Store raw message
-      const messageId = insertMessage({
-        imessage_row_id: msg.rowId,
-        raw_text: msg.text ?? undefined,
-        media_type: type,
-        transcript,
-        file_summary: fileSummary,
-      });
+        let transcript: string | undefined;
+        let fileSummary: string | undefined;
+        let type = classifyMessage(msg);
 
-      const effectiveText = getEffectiveText(msg, transcript, fileSummary);
+        let attachmentPath: string | undefined = msg.attachments?.[0]?.localPath ?? undefined;
+        let attachmentMime: string = msg.attachments?.[0]?.mimeType ?? "";
 
-      // Add to conversation buffer
-      buffer.push({
-        role: "user",
-        content: effectiveText,
-        timestamp: new Date().toISOString(),
-      });
+        // Trigger fallback when:
+        // - SDK gave empty attachments AND
+        // - message has attachment placeholder char OR no real text (image-only)
+        const looksLikeMedia = msg.attachments.length === 0 && (hasPlaceholder || !plainText);
+        if (!attachmentPath && (msg.hasAttachments || looksLikeMedia)) {
+          console.log(`[alfred] querying chat.db for attachments (rowId: ${msg.rowId}, hasAttachments=${msg.hasAttachments}, looksLikeMedia=${looksLikeMedia})`);
+          const resolved = await resolveAttachment(msg.rowId);
+          if (resolved) {
+            attachmentPath = resolved.localPath;
+            attachmentMime = resolved.mimeType;
+            const mime = attachmentMime.toLowerCase();
+            const p = attachmentPath.toLowerCase();
+            if (mime.startsWith("audio/") || /\.(caf|m4a|mp3)$/.test(p)) type = "audio";
+            else if (mime.startsWith("image/") || /\.(jpg|jpeg|png|gif|heic|heif|webp)$/.test(p)) type = "image";
+            else type = "file";
+          }
+        }
 
-      // Classify intent — determines whether to reply at all and how long
-      const mode = await classifyIntent(effectiveText);
-      console.log(`[alfred] mode: ${mode}`);
+        if (attachmentPath) {
+          console.log(`[alfred] attachment: type=${type} path=${attachmentPath} mime=${attachmentMime}`);
+        }
 
-      // For silent messages, occasionally send a brief acknowledgment (~50% of the time)
-      if (mode === "silent" && Math.random() < 0.3) {
-        const acks = ["👍", "👀", "ok", "gotcha"];
-        const ack = acks[Math.floor(Math.random() * acks.length)];
-        await sendBubbles(sdk, ack);
-      }
+        // Handle attachments
+        if (type === "audio" && attachmentPath) {
+          transcript = (await transcribeAudio(attachmentPath)) ?? undefined;
+        } else if (type === "image" && attachmentPath) {
+          fileSummary = (await summarizeImageFromPath(attachmentPath)) ?? undefined;
+        } else if (type === "file" && attachmentPath) {
+          fileSummary = (await summarizeFile(attachmentPath)) ?? undefined;
+        }
 
-      if (mode !== "silent") {
-        // Small delay — gives iMessage time to deliver any trailing messages
-        // (e.g. link previews, follow-up texts sent right after) before we respond
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        console.log("[alfred] building context...");
-        const systemPrompt = await buildContext(buffer, mode);
-        console.log("[alfred] calling LLM...");
-        const reply = await chat(systemPrompt, effectiveText);
-        console.log("[alfred] reply:", reply);
+        // Store raw message
+        const messageId = insertMessage({
+          imessage_row_id: msg.rowId,
+          raw_text: msg.text ?? undefined,
+          media_type: type,
+          transcript,
+          file_summary: fileSummary,
+        });
 
-        await sendBubbles(sdk, reply);
-        console.log("[alfred] sent reply");
+        const effectiveText = getEffectiveText(msg, transcript, fileSummary);
 
-        // Add Alfred's reply to buffer
+        // Add to conversation buffer immediately (before response debounce)
         buffer.push({
-          role: "assistant",
-          content: reply.replace(/\[SPLIT\]/g, " "),
+          role: "user",
+          content: effectiveText,
           timestamp: new Date().toISOString(),
         });
-      }
 
-      // Fire any due reminders triggered by this message
-      checkDueReminders(sdk);
+        // Fire classifier immediately (non-blocking) — runs in parallel with retrieval
+        const modePromise: Promise<ResponseMode> = (transcript || fileSummary)
+          ? Promise.resolve("full" as const)
+          : classifyWithTimeout(effectiveText);
 
-      // Queue for session-based extraction (batches up to 5 messages or 2 min idle)
-      queueForExtraction(effectiveText, messageId);
+        // Queue for debounced response — resets timer if user sends another
+        // message within RESPONSE_DEBOUNCE_MS (simulates typing detection)
+        scheduleResponse(effectiveText, modePromise);
+
+        // Fire any due reminders triggered by this message
+        checkDueReminders(sdk);
+
+        // Queue for session-based extraction (batches up to 5 messages or 2 min idle)
+        queueForExtraction(effectiveText, messageId);
       } catch (err) {
         console.error("[alfred] handler error:", err);
       }

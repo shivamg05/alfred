@@ -12,7 +12,7 @@ import {
   getDynamicProfileFacts,
   searchFactsFTS,
 } from "./facts.js";
-import { upsertFact as chromaUpsert } from "./vectors.js";
+import { upsertFact as chromaUpsert, querySimilarFacts } from "./vectors.js";
 import { createTask } from "../integrations/todoist.js";
 
 // ---------------------------------------------------------------------------
@@ -90,9 +90,15 @@ const extractionSchema = z
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Strip markdown code fences — some models wrap JSON in ```json ... ``` */
-function stripCodeFences(s: string): string {
-  return s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+/**
+ * Extract the first JSON object from a string.
+ * Handles: raw JSON, ```json fenced JSON, fenced JSON followed by explanation text.
+ */
+function extractJSON(s: string): string {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) return s.slice(start, end + 1);
+  return s.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -211,8 +217,12 @@ export async function extractFromMessage(opts: {
   const cfg = config();
   console.log(`[extractor] running on message ${opts.messageId} (${opts.messageText.length} chars)`);
 
-  // Fetch existing profile so the model can skip duplicates and flag updates
-  const existingFacts = [...getStaticProfileFacts(), ...getDynamicProfileFacts()];
+  // Build "what you already know" context for the LLM:
+  // profile facts (always) + topically-relevant recent facts (FTS search on session text)
+  // This prevents re-extraction of facts that are already stored about the same topic.
+  const profileFacts = [...getStaticProfileFacts(), ...getDynamicProfileFacts()];
+  const topicFacts = searchFactsFTS(opts.messageText, 20).map((h) => h.text);
+  const existingFacts = [...new Set([...profileFacts, ...topicFacts])].slice(0, 40);
 
   let raw: string;
   try {
@@ -234,7 +244,7 @@ export async function extractFromMessage(opts: {
 
   let parsed: z.infer<typeof extractionSchema>;
   try {
-    parsed = extractionSchema.parse(JSON.parse(stripCodeFences(raw)));
+    parsed = extractionSchema.parse(JSON.parse(extractJSON(raw)));
   } catch (err) {
     console.error("[extractor] parse failed:", raw, err);
     return;
@@ -275,6 +285,18 @@ export async function extractFromMessage(opts: {
 
   // --- Memory facts ---
   for (const fact of parsed.facts) {
+    // Pre-insertion similarity guard: skip if an existing fact is nearly identical.
+    // Catches cases where the LLM rephrases an existing fact rather than skipping it.
+    try {
+      const nearby = await querySimilarFacts(fact.text, 1);
+      if (nearby.length > 0 && nearby[0].distance < 0.15) {
+        console.log(`[extractor] skip near-duplicate (dist=${nearby[0].distance.toFixed(3)}): "${fact.text.slice(0, 60)}" ≈ "${nearby[0].text.slice(0, 60)}"`);
+        continue;
+      }
+    } catch {
+      // ChromaDB not ready — proceed without guard
+    }
+
     console.log(`[extractor] fact: "${fact.text}" (static=${fact.is_static})`);
     try {
       const factId = insertFact({
@@ -312,6 +334,27 @@ export async function extractFromMessage(opts: {
           user_id: config().USER_ID,
         });
         updateChromaId(factId, chromaId);
+
+        // --- Knowledge graph: auto-wire relates_to edges ---
+        // Query ChromaDB for semantically similar existing facts.
+        // Distance < 0.12: near-duplicate, skip (already handled by dedup/contradiction)
+        // Distance 0.12–0.55: clearly related — create a graph edge
+        // Distance > 0.55: too loosely related, skip
+        try {
+          const similar = await querySimilarFacts(fact.text, 10);
+          const wired: number[] = [];
+          for (const hit of similar) {
+            if (hit.factId === factId || hit.factId <= 0) continue;
+            if (hit.distance < 0.12 || hit.distance > 0.55) continue;
+            insertRelation(factId, hit.factId, "relates_to");
+            wired.push(hit.factId);
+          }
+          if (wired.length > 0) {
+            console.log(`[extractor] graph edges: fact_${factId} ↔ [${wired.map(id => `fact_${id}`).join(", ")}]`);
+          }
+        } catch {
+          // ChromaDB query failed — skip graph wiring, not critical
+        }
       } catch (err) {
         console.error(`[extractor] ChromaDB upsert failed for "${fact.text}":`, err);
       }
