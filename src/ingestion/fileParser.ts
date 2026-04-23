@@ -2,9 +2,8 @@ import { readFileSync, existsSync } from "fs";
 import { makeOpenAIClient } from "../orchestrator/llm.js";
 import { config } from "../config.js";
 
-// Vision model — claude-haiku-4.5 supports vision and is on OpenRouter.
 function visionModel(): string {
-  return config().LLM_BASE_URL ? "anthropic/claude-haiku-4-5" : "gpt-4o";
+  return config().LLM_BASE_URL ? "google/gemini-2.5-flash-lite" : "gpt-4o";
 }
 
 function bufferToDataUrl(buf: Buffer, mimeType: string): string {
