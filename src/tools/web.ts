@@ -9,40 +9,30 @@ function headers(): Record<string, string> {
   };
 }
 
-/** Search the web via Firecrawl. Returns clean markdown excerpts. */
+/** Search the web via Firecrawl. Returns title + description (no scraping = fastest). */
 export async function searchWeb(query: string): Promise<string> {
   const res = await fetch(`${BASE}/search`, {
     method: "POST",
     headers: headers(),
-    body: JSON.stringify({
-      query,
-      limit: 5,
-      scrapeOptions: { formats: ["markdown"] },
-    }),
+    body: JSON.stringify({ query, limit: 5 }),
   });
 
   if (!res.ok) throw new Error(`Firecrawl search failed: ${res.status}`);
 
-  const body = await res.json() as Record<string, unknown>;
-  console.log(`[tools/web] search response keys: ${Object.keys(body).join(", ")}`);
+  const body = await res.json() as { success: boolean; data?: { web?: unknown[] } };
 
-  // Firecrawl v2 search returns { success, data: [...] }
-  const results = (body.data ?? body.results ?? []) as Array<{
+  // Firecrawl v2 search returns { success, data: { web: [...] } }
+  const results = (body.data?.web ?? []) as Array<{
     url: string;
     title?: string;
     description?: string;
-    markdown?: string;
   }>;
 
   if (!results.length) return "No results found.";
 
   return results
     .slice(0, 5)
-    .map((r) => {
-      const header = `**${r.title ?? r.url}**\n${r.url}`;
-      const content = r.markdown?.slice(0, 600) ?? r.description ?? "";
-      return `${header}\n${content}`;
-    })
+    .map((r) => `**${r.title ?? r.url}**\n${r.url}\n${r.description ?? ""}`)
     .join("\n\n---\n\n");
 }
 
