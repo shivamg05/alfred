@@ -177,7 +177,12 @@ export function insertInstanceOfRelation(
     return false;
   }
   const inserted = insertRelation(childId, parentId, "instance_of");
-  if (inserted && opts.propagate !== false) propagateDescendantIncrement(parentId);
+  if (inserted && opts.propagate !== false) {
+    // delta = 1 (the child itself) + child's existing subtree size
+    const child = getFactById(childId);
+    const delta = 1 + (child?.descendant_count ?? 0);
+    propagateDescendantIncrement(parentId, delta);
+  }
   return inserted;
 }
 
@@ -243,9 +248,13 @@ export function rewireChildren(oldParentId: number, newParentId: number): void {
 
 /**
  * Called after wiring a new child to parentId (via instance_of edge). Increments
- * descendant_count on parentId and all ancestors. Multi-parent and cycle safe.
+ * descendant_count on parentId and all ancestors by `delta`.
+ *
+ * delta should be 1 + child.descendant_count so the parent's count reflects the
+ * full subtree size being added, not just the immediate child.
+ * Multi-parent and cycle safe.
  */
-export function propagateDescendantIncrement(parentId: number): void {
+export function propagateDescendantIncrement(parentId: number, delta = 1): void {
   const stack = [parentId];
   const visited = new Set<number>();
   while (stack.length > 0) {
@@ -253,8 +262,8 @@ export function propagateDescendantIncrement(parentId: number): void {
     if (currentId === undefined || visited.has(currentId)) continue;
     visited.add(currentId);
     db()
-      .prepare("UPDATE memory_facts SET descendant_count = descendant_count + 1 WHERE id = ?")
-      .run(currentId);
+      .prepare("UPDATE memory_facts SET descendant_count = descendant_count + ? WHERE id = ?")
+      .run(delta, currentId);
     stack.push(...getInstanceOfParents(currentId));
   }
 }
