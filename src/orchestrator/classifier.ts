@@ -18,21 +18,21 @@ function extractJSON(s: string): string {
 
 const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "acknowledge" | "brief" | "full" }
 
-bias toward silent and acknowledge. Most messages don't need a full response.
+silent — pure reaction, nothing to confirm or engage with.
+  → "lol", "fr", "damn", "ok", "ya true", "deadass", "bet", "💀"
 
-silent — pure reactions, nothing to confirm, no action taken ("lol", "fr", "damn", "ok", "yeah", "nice", "bet", "deadass")
-  → "lol fr" / "ya true" / "deadass" / "woke up at 7" (pure info dump, no action needed)
+acknowledge — explicit command to record/note something, or user explicitly says they don't want engagement.
+  → "remind me to call mom tomorrow" / "note that i have a meeting at 3" / "i don't wanna talk about it" / "just fyi i'm heading out"
+  NOT acknowledge: venting, sharing news, updates about their life, anything that opens a topic
 
-acknowledge — user wants to feel heard or confirmed, but doesn't want conversation. Action was implicit (reminder set, note taken) or they're sharing something heavy without asking for engagement.
-  → "remind me to call mom tomorrow" / "note that i have a meeting at 3" / "i'm so tired of this" / "just finished a 10 mile run" / "my summer is split into 3 tracks" / "i don't wanna talk about it"
+brief — sharing something, venting, starting a topic, or updating alfred on their life. Invites a natural reaction or follow-up.
+  → "work has been crazy" / "kinda nervous about tomorrow" / "just finished the project" / "my summer is split into 3 tracks" / "i'm so tired of this" / "just got back from the gym"
 
-brief — worth a quick take or reaction, not just confirmation. One sentence opinion or observation.
-  → "kinda nervous about tomorrow" / "just finished the project" / "might apply to that fellowship" / "thinking about X"
+full — explicit question, request, or asking alfred to do/look up/check something.
+  → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?" / "where am I?" / "tell me X"
 
-full — explicit question, request for help, or asking for Alfred's opinion on something specific.
-  → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?"
-
-Default to acknowledge if unsure. Only pick full if they clearly want a response.`;
+When the conversation context shows a prior question or request, treat follow-ups as full.
+Default to brief if unsure.`;
 
 export interface ClassifierMessage {
   role: "user" | "assistant";
@@ -57,6 +57,35 @@ export async function classifyWithTimeout(
   ]);
 }
 
+const ACK_PROMPT = `You are Alfred, a personal AI in iMessage. Generate a single short acknowledgment (1-4 words max) for the message below. It should feel natural and human — like a friend texting back. Match the tone. No punctuation at end. Lowercase only. Examples: "noted", "got it", "👍", "on it", "makes sense", "yep got it", "noted 👍".`;
+
+export async function generateContextualAck(
+  userMessage: string,
+  recentMessages: ClassifierMessage[] = [],
+): Promise<string> {
+  const fallbacks = ["noted", "got it", "👍", "noted 👍", "yep noted"];
+  const t0 = Date.now();
+  try {
+    const contextBlock = recentMessages.length > 0
+      ? `\nRECENT CONVERSATION:\n${recentMessages.slice(-4).map((m) => `[${m.role === "assistant" ? "alfred" : "user"}]: ${m.content}`).join("\n")}\n`
+      : "";
+    const response = await llmClient().chat.completions.create({
+      model: "google/gemini-2.5-flash-lite",
+      messages: [
+        { role: "system", content: ACK_PROMPT + contextBlock },
+        { role: "user", content: userMessage },
+      ],
+      max_tokens: 20,
+      temperature: 0.7,
+    });
+    const raw = (response.choices[0]?.message?.content ?? "").trim();
+    console.log(`[classifier] ack generated: "${raw}" (${Date.now() - t0}ms)`);
+    return raw || fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  } catch {
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+}
+
 export async function classifyIntent(
   userMessage: string,
   recentMessages: ClassifierMessage[] = [],
@@ -65,7 +94,7 @@ export async function classifyIntent(
 
   // Build context string from recent conversation so classifier understands follow-ups
   const contextBlock = recentMessages.length > 0
-    ? `\nRECENT CONVERSATION (for context only):\n${recentMessages.map((m) => `${m.role === "assistant" ? "alfred" : "them"}: ${m.content}`).join("\n")}\n`
+    ? `\nRECENT CONVERSATION (for context only):\n${recentMessages.map((m) => `[${m.role === "assistant" ? "alfred" : "user"}]: ${m.content}`).join("\n")}\n`
     : "";
 
   try {

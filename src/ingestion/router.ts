@@ -21,11 +21,19 @@ export function classifyMessage(msg: Message): MessageType {
   return "unknown";
 }
 
-export function getEffectiveText(msg: Message, transcript?: string, fileSummary?: string): string {
+export function getEffectiveText(
+  msg: Message,
+  transcript?: string,
+  fileSummary?: string,
+  mediaType?: MessageType,
+): string {
   // Strip iMessage's object-replacement character (attachment placeholder)
   const cleanText = (msg.text ?? "").replace(/\uFFFC/g, "").trim();
 
   if (transcript) return `[voice message]: ${transcript}`;
-  if (fileSummary) return cleanText ? `${cleanText}\n[image: ${fileSummary}]` : `[image: ${fileSummary}]`;
+  if (fileSummary) {
+    const label = mediaType === "file" ? "file" : "image";
+    return cleanText ? `${cleanText}\n[${label}: ${fileSummary}]` : `[${label}: ${fileSummary}]`;
+  }
   return cleanText || "[unsupported attachment]";
 }

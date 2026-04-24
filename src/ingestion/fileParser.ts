@@ -84,11 +84,15 @@ export async function summarizeFile(filePath: string): Promise<string | null> {
   try {
     const ext = filePath.split(".").pop()?.toLowerCase();
     if (ext === "pdf") {
-      const pdfParseModule = await import("pdf-parse");
-      const pdfParse = (pdfParseModule as unknown as { default: (buf: Buffer) => Promise<{ text: string }> }).default ?? pdfParseModule;
+      const { PDFParse } = await import("pdf-parse");
       const buffer = readFileSync(filePath);
-      const data = await pdfParse(buffer);
-      rawText = data.text;
+      const parser = new PDFParse({ data: buffer });
+      try {
+        const data = await parser.getText();
+        rawText = data.text;
+      } finally {
+        await parser.destroy();
+      }
     } else if (ext === "docx" || ext === "doc") {
       const mammoth = await import("mammoth");
       const result = await mammoth.extractRawText({ path: filePath });

@@ -17,7 +17,7 @@ import { transcribeAudio } from "./ingestion/transcription.js";
 import { summarizeImageFromPath, summarizeFile } from "./ingestion/fileParser.js";
 import { fetchContext, buildPrompt } from "./orchestrator/context.js";
 import { chat, SEARCH_ACKS } from "./orchestrator/llm.js";
-import { classifyWithTimeout } from "./orchestrator/classifier.js";
+import { classifyWithTimeout, generateContextualAck } from "./orchestrator/classifier.js";
 import { sendBubbles } from "./orchestrator/response.js";
 import { checkDueReminders, registerCronJobs } from "./proactive/engine.js";
 import { resolveAttachment, resolveAttachments } from "./ingestion/attachments.js";
@@ -131,13 +131,17 @@ async function main(): Promise<void> {
       modes.some((m) => m === "acknowledge") ? "acknowledge" :
       "silent";
 
-    console.log(`[alfred] responding to ${batch.length} message(s) as ${mode}`);
+    console.log(`[alfred] responding to ${batch.length} message(s) as ${mode} | input: "${combinedText.slice(0, 80)}"`);
 
     if (mode === "silent") return;
 
     if (mode === "acknowledge") {
-      const acks = ["noted", "got it", "heard", "on it", "👍", "👀", "noted 👍", "yep noted", "i hear you", "got it 👍"];
-      await sendBubbles(sdk, acks[Math.floor(Math.random() * acks.length)]);
+      const recentForAck = buffer.getRecent(4).map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      }));
+      const ack = await generateContextualAck(combinedText, recentForAck);
+      await sendBubbles(sdk, ack);
       return;
     }
 
@@ -153,7 +157,7 @@ async function main(): Promise<void> {
       await sendBubbles(sdk, reply);
       const tSend = Date.now();
       console.log(`[alfred] timings — classify+context:${tContext - t0}ms llm:${tLLM - tContext}ms send:${tSend - tLLM}ms total:${tSend - t0}ms wall:${tSend - wallStart}ms`);
-      console.log("[alfred] reply:", reply);
+      console.log(`[alfred] reply (${mode}): ${reply}`);
 
       buffer.push({
         role: "assistant",
@@ -249,7 +253,7 @@ async function main(): Promise<void> {
           file_summary: fileSummary,
         });
 
-        const effectiveText = getEffectiveText(msg, transcript, fileSummary);
+        const effectiveText = getEffectiveText(msg, transcript, fileSummary, type);
 
         // Add to conversation buffer immediately (before response debounce)
         buffer.push({
