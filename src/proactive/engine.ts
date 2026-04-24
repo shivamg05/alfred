@@ -2,6 +2,7 @@ import cron from "node-cron";
 import type { IMessageSDK } from "@photon-ai/imessage-kit";
 import {
   getDueReminders,
+  getStrictlyDueReminders,
   markReminderFired,
   getUpcomingEventFacts,
   logProactive,
@@ -11,6 +12,7 @@ import { sendBubbles } from "../orchestrator/response.js";
 import { chat } from "../orchestrator/llm.js";
 import { fetchContext, buildPrompt } from "../orchestrator/context.js";
 import { ConversationBuffer } from "../memory/shortTerm.js";
+import { consolidateExpiredLevel0, promoteLevel1Patterns } from "../memory/consolidation.js";
 
 const PROACTIVE_SUFFIX = `
 
@@ -26,10 +28,11 @@ async function runProactiveChat(
   logType: string,
 ): Promise<void> {
   const emptyBuffer = new ConversationBuffer();
-  const contextData = await fetchContext(emptyBuffer);
+  const wantsTodoist = /\b(todoist|task|tasks|due|overdue)\b/i.test(trigger);
+  const contextData = await fetchContext(emptyBuffer, { includeTodoist: wantsTodoist });
   const systemPrompt = buildPrompt(contextData, "full") + PROACTIVE_SUFFIX;
 
-  const msg = await chat(systemPrompt, `[internal: ${trigger}]`);
+  const msg = await chat(systemPrompt, `[internal: ${trigger}]`, { allowTools: true });
 
   if (!msg || msg.trim() === "SKIP" || msg.toUpperCase().includes("SKIP")) {
     console.log(`[proactive] ${logType} → skipped`);
@@ -56,6 +59,29 @@ export function checkDueReminders(sdk: IMessageSDK): void {
 }
 
 export function registerCronJobs(sdk: IMessageSDK): void {
+  // Every minute — fire any reminders that are past due.
+  cron.schedule("* * * * *", () => {
+    const due = getStrictlyDueReminders();
+    for (const reminder of due) {
+      const text = `hey don't forget — ${reminder.text}`;
+      if (shouldSendProactive(text)) {
+        sendBubbles(sdk, text).catch(console.error);
+        logProactive("reminder", text);
+      }
+      markReminderFired(reminder.id);
+    }
+  });
+
+  // Every 6 hours — expire short-lived facts and consolidate repeated state/event evidence.
+  cron.schedule("17 */6 * * *", async () => {
+    await consolidateExpiredLevel0().catch(console.error);
+  });
+
+  // Weekly — promote supported behavioral patterns into identity/value memories.
+  cron.schedule("30 3 * * 0", async () => {
+    await promoteLevel1Patterns().catch(console.error);
+  });
+
   // 9am — morning brief: today's tasks + upcoming events in next 7 days
   cron.schedule("0 9 * * *", async () => {
     const upcoming = getUpcomingEventFacts(7);

@@ -3,6 +3,7 @@ import { config } from "../config.js";
 import { makeOpenAIClient } from "../orchestrator/llm.js";
 import {
   insertFact,
+  insertInstanceOfRelation,
   insertRelation,
   markSuperseded,
   insertReminder,
@@ -10,10 +11,12 @@ import {
   upsertProfileFact,
   getStaticProfileFacts,
   getDynamicProfileFacts,
+  getLevel2Facts,
+  getBedrockFacts,
+  getFactById,
   searchFactsFTS,
 } from "./facts.js";
 import { upsertFact as chromaUpsert, querySimilarFacts } from "./vectors.js";
-import { createTask } from "../integrations/todoist.js";
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -25,16 +28,22 @@ const factSchema = z
     text: z.string().optional(),
     fact: z.string().optional(),
     is_static: z.boolean(),
+    abstraction_level: z.coerce.number().int().min(0).max(2).default(1),
     forget_after: z.string().optional(),
     event_date: z.string().optional(),
     contradicts_hint: z.string().optional(),
+    extends_hint: z.string().optional(),
+    parent_hint: z.string().optional(),
   })
   .transform((d) => ({
     text: (d.text ?? d.fact ?? "").trim(),
     is_static: d.is_static,
+    abstraction_level: d.abstraction_level as 0 | 1 | 2,
     forget_after: d.forget_after,
     event_date: d.event_date,
     contradicts_hint: d.contradicts_hint,
+    extends_hint: d.extends_hint,
+    parent_hint: d.parent_hint,
   }))
   .refine((d) => d.text.length > 0, { message: "fact must have non-empty text" });
 
@@ -43,16 +52,10 @@ const reminderSchema = z.object({
   due_at: z.string(),
 });
 
-const todoistTaskSchema = z.object({
-  content: z.string(),
-  due_string: z.string().optional(),
-});
-
 const extractionSchema = z
   .object({
     facts: z.array(z.unknown()).default([]),
     reminders: z.array(z.unknown()).default([]),
-    todoist_tasks: z.array(z.unknown()).default([]),
     follow_up_reminders: z.array(z.unknown()).default([]),
   })
   .transform((data) => ({
@@ -62,7 +65,16 @@ const extractionSchema = z
         if (typeof f === "string") {
           const text = f.trim();
           return text
-            ? { text, is_static: false, forget_after: undefined, event_date: undefined, contradicts_hint: undefined }
+            ? {
+                text,
+                is_static: false,
+                abstraction_level: 0,
+                forget_after: undefined,
+                event_date: undefined,
+                contradicts_hint: undefined,
+                extends_hint: undefined,
+                parent_hint: undefined,
+              }
             : null;
         }
         const r = factSchema.safeParse(f);
@@ -73,13 +85,6 @@ const extractionSchema = z
       .map((r) => reminderSchema.safeParse(r))
       .filter((r) => r.success)
       .map((r) => (r as { success: true; data: { text: string; due_at: string } }).data),
-    todoist_tasks: data.todoist_tasks
-      .map((t) => todoistTaskSchema.safeParse(t))
-      .filter((t) => t.success)
-      .map(
-        (t) =>
-          (t as { success: true; data: { content: string; due_string?: string } }).data,
-      ),
     follow_up_reminders: data.follow_up_reminders
       .map((r) => reminderSchema.safeParse(r))
       .filter((r) => r.success)
@@ -123,7 +128,7 @@ function buildExtractionPrompt(documentDate: string, existingFacts: string[]): s
 
   return `You extract structured memory from one or more personal iMessages. The user is texting a personal AI journal about their life.
 
-IMPORTANT: Extract aggressively. Better to over-extract than miss something. If a message contains genuinely NEW information, extract it. Skip anything already captured in "What you already know".
+IMPORTANT: Extract useful memory aggressively, but keep facts atomic and typed. If a message contains genuinely NEW information, extract it. Skip anything already captured in "What you already know" unless it changed or adds detail.
 ${existingSection}
 Today's datetime: ${documentDate}
 
@@ -131,78 +136,152 @@ Return a JSON object — all fields required (use empty arrays if nothing applie
 {
   "facts": [...],
   "reminders": [...],
-  "todoist_tasks": [...],
   "follow_up_reminders": [...]
 }
 
-═══════════════════════
 FACTS — each fact MUST be a JSON object, not a string:
-  { "text": "User ...", "is_static": true/false }
-5 categories:
-═══════════════════════
+  {
+    "text": "User ...",
+    "abstraction_level": 0 | 1 | 2,
+    "is_static": true | false,
+    "event_date": "ISO date or datetime if relevant",
+    "forget_after": "ISO datetime, ONLY for level 0",
+    "contradicts_hint": "old fact phrase if this corrects/replaces it",
+    "extends_hint": "old fact phrase if this refines/adds detail without contradiction",
+    "parent_hint": "existing higher-level fact this is an instance of"
+  }
 
-1. PROFILE (stable, long-term — is_static: true)
-   Who they are: occupation, school, location, relationships, identity
-   "I work at Google" → "User works at Google"
-   "I'm a junior at MIT" → "User attends MIT as a junior"
-   "my girlfriend Sarah" → "User has a girlfriend named Sarah"
+ABSTRACTION LEVELS:
 
-2. CURRENT CONTEXT (temporary state — is_static: false)
-   Active projects, current goals, ongoing priorities, current life situation
-   "working on a startup called Life Sim" → "User is building a startup called Life Sim"
-   "taking a gap semester in the fall" → "User is taking a gap semester in fall 2026"
-   "my life is split between X, Y, Z" → one summary fact + one fact per item
+Level 0: specific event, state, plan, or one-off observation.
+  Examples: "User is tired", "User has an exam on 2026-04-29", "User played soccer yesterday", "User submitted the YC application"
+  These can expire. Current state expires quickly; dated plans/events expire shortly after event_date.
 
-3. PREFERENCES (stable — is_static: true)
-   What they like, hate, value, how they operate
-   "I hate commuting" → "User dislikes commuting"
-   "I always work late" → "User tends to work late"
+Level 1: recurring behavior, habit, pattern, or medium-term active context.
+  Examples: "User plays soccer regularly", "User struggles with consistent gym attendance", "User tends to overcommit across school, startup, and fitness"
+  These do not expire by time; they update or refine as new evidence accumulates.
 
-4. EVENTS (things that happened or will happen — is_static: false)
-   Past/upcoming milestones, deadlines, trips, meetings
-   event_date: REQUIRED — extract specific date or best estimate
-   "internship this summer" → event_date: "${new Date().getFullYear()}-06-01"
-   "conference next month" → event_date: estimate from today
+Level 2: core identity, values, character, or durable self-model.
+  Examples: "User values ambitious building projects", "User fears wasting potential", "User values physical competition"
+  These do not expire by time, but they can be updated if the user explicitly changes.
 
-5. UPDATES (corrects/supersedes a prior fact — is_static: depends)
-   "I changed my mind", "actually I'm doing Y instead of X now"
-   contradicts_hint: short phrase from the OLD fact being replaced
-   IMPORTANT: set contradicts_hint on the NEW fact only. Do NOT create a separate fact about what the user "previously said" or "used to think".
+If unsure between levels, choose the lower level. Consolidation will promote patterns later.
 
-═══════════════════════
+VERSIONING:
+- Use contradicts_hint when the new fact makes an old fact false or replaces it.
+- Use extends_hint when the new fact adds detail or makes an older fact more specific without making it false.
+- Do not create a separate fact about what the user "previously said" or "used to think".
+
+PARENTS:
+- Use parent_hint when this fact is clearly an instance of an existing higher-level fact in WHAT YOU ALREADY KNOW.
+- Level 0 facts can have Level 1 parents. Level 1 facts can have Level 2 parents. Never connect Level 0 directly to Level 2.
+
 EXTRACTION RULES:
-═══════════════════════
 - Third person always: "User" not "I"
-- ONE fact per entry — never bundle. "doing X and Y" → two separate facts
-- LISTS = multiple facts. "my life has 3 parts: A, B, C" → 4 facts (3 items + 1 summary)
-- Names of people → "User's [relationship] is named [Name]"
-- Projects/startups/companies → always extract, include name if given
-- is_static: true for stable identity/preferences, false for current situations/events
-- forget_after: set for temporary facts. event_date + 8 weeks, or today + 3 weeks for vague ongoing states
+- ONE fact per entry — never bundle. "doing X and Y" means two separate facts
+- LISTS = multiple facts. "my life has 3 parts: A, B, C" means one summary fact plus one fact per item
+- Names of people: "User has a friend named Ethan"
+- Projects/startups/companies: always extract, include name if given
+- is_static means unlikely to change, independent of abstraction level. Past confirmed events can be static. Future plans usually are not.
+- forget_after is ONLY for level 0. Current state: today + 12 hours. Dated event/plan: event_date + 24 hours. Level 1 and 2: omit forget_after.
 - Lean toward extraction. A slightly redundant fact is fine. A missed fact is bad.
-- DO NOT extract meta/conversational noise: "User is discussing X", "User is asking about Y", "User is wondering about Z", "User joked that...", "User is asking for advice on..." — these add no lasting memory value. Only extract facts about their actual life, opinions, plans, or identity.
+- DO NOT extract meta/conversational noise: "User is discussing X", "User is asking about Y", "User joked that..." — only extract facts about their actual life, opinions, plans, or identity.
 
-═══════════════════════
-REMINDERS — only explicit asks:
-═══════════════════════
-Triggers: "remind me", "don't let me forget", "ping me at X", "i have to", "i need to"
+REMINDERS — explicit asks AND time-bound intent:
+Triggers: "remind me", "don't let me forget", "ping me", "i have to X in N minutes/hours", "i need to X in N minutes/hours", "i gotta X by [time]"
+NOT triggers: open-ended intent with no time ("i should call mom", "i need to study more") — only create a reminder if there's a clear timeframe
 due_at: ISO8601 datetime (use today's date + time context to compute)
 
-═══════════════════════
-TODOIST_TASKS — implicit future intent:
-═══════════════════════
-Triggers: "i need to", "i have to", "gotta", "should probably", "need to get"
-content: short actionable title
-due_string: natural language date ONLY if user mentioned one ("tomorrow", "next monday", "in 3 days"). OMIT entirely if no date was given — do NOT write "no specific due date" or similar.
-
-═══════════════════════
 FOLLOW_UP_REMINDERS — deferred plans:
-═══════════════════════
 Triggers: "wanna X later", "gonna X later", "planning to X", "meant to X"
 Alfred creates a check-in: "hey did you ever [X]?"
 due_at estimate: "later"=+4h, "tonight"=9pm today, "tomorrow"=next 9am, "this week"=+3days 9am
 
 If truly nothing extractable: {"facts":[],"reminders":[],"todoist_tasks":[],"follow_up_reminders":[]}`;
+}
+
+function addHoursISO(base: string, hours: number): string {
+  const d = new Date(base);
+  if (Number.isNaN(d.getTime())) return new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  d.setHours(d.getHours() + hours);
+  return d.toISOString();
+}
+
+function normalizeForgetAfter(fact: z.infer<typeof factSchema>, documentDate: string): string | undefined {
+  if (fact.abstraction_level !== 0) return undefined;
+  if (fact.forget_after) return fact.forget_after;
+  if (fact.event_date) return addHoursISO(fact.event_date, 24);
+  return addHoursISO(documentDate, 12);
+}
+
+function factLine(f: { text: string; abstraction_level: number }): string {
+  return `[L${f.abstraction_level}] ${f.text}`;
+}
+
+function findHintFact(hint: string, expectedLevel?: number, excludeId?: number): number | undefined {
+  const candidates = searchFactsFTS(hint, 8);
+  for (const c of candidates) {
+    if (c.id === excludeId) continue;
+    const f = getFactById(c.id);
+    if (!f || !f.is_latest || f.is_forgotten) continue;
+    if (expectedLevel !== undefined && f.abstraction_level !== expectedLevel) continue;
+    return f.id;
+  }
+  return undefined;
+}
+
+const MAX_INSTANCE_PARENTS = 3;
+const INSTANCE_PARENT_DISTANCE = 0.42;
+const INSTANCE_CHILD_DISTANCE = 0.42;
+
+async function wireParent(factId: number, factText: string, level: 0 | 1 | 2, parentHint?: string): Promise<void> {
+  if (level >= 2) return;
+  const parentLevel = level + 1;
+  const parentIds: number[] = [];
+  const hintedParentId = parentHint ? findHintFact(parentHint, parentLevel, factId) : undefined;
+  if (hintedParentId) parentIds.push(hintedParentId);
+
+  try {
+    const hits = await querySimilarFacts(factText, 8, { abstraction_level: parentLevel });
+    for (const hit of hits) {
+      if (parentIds.length >= MAX_INSTANCE_PARENTS) break;
+      if (hit.factId === factId || hit.distance > INSTANCE_PARENT_DISTANCE) continue;
+      const f = getFactById(hit.factId);
+      if (!f || !f.is_latest || f.is_forgotten || f.abstraction_level !== parentLevel) continue;
+      if (parentIds.includes(f.id)) continue;
+      parentIds.push(f.id);
+    }
+  } catch {
+    // ChromaDB unavailable; parent wiring can be recovered by consolidation later.
+  }
+
+  const wired: number[] = [];
+  for (const parentId of parentIds) {
+    if (insertInstanceOfRelation(factId, parentId)) wired.push(parentId);
+  }
+  if (wired.length > 0) {
+    console.log(`[extractor] instance parents: fact_${factId} -> [${wired.map(id => `fact_${id}`).join(", ")}]`);
+  }
+}
+
+async function wireExistingChildren(parentId: number, parentText: string, parentLevel: 0 | 1 | 2): Promise<void> {
+  if (parentLevel <= 0) return;
+  const childLevel = parentLevel - 1;
+  const wired: number[] = [];
+  try {
+    const hits = await querySimilarFacts(parentText, 12, { abstraction_level: childLevel });
+    for (const hit of hits) {
+      if (hit.factId === parentId || hit.distance > INSTANCE_CHILD_DISTANCE) continue;
+      const child = getFactById(hit.factId);
+      if (!child || !child.is_latest || child.is_forgotten || child.abstraction_level !== childLevel) continue;
+      if (insertInstanceOfRelation(child.id, parentId)) wired.push(child.id);
+    }
+  } catch {
+    // ChromaDB unavailable; children can still be wired by future extraction/consolidation.
+  }
+  if (wired.length > 0) {
+    console.log(`[extractor] instance children: fact_${parentId} <- [${wired.map(id => `fact_${id}`).join(", ")}]`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +300,9 @@ export async function extractFromMessage(opts: {
   // profile facts (always) + topically-relevant recent facts (FTS search on session text)
   // This prevents re-extraction of facts that are already stored about the same topic.
   const profileFacts = [...getStaticProfileFacts(), ...getDynamicProfileFacts()];
+  const levelFacts = [...getLevel2Facts(), ...getBedrockFacts()].map(factLine);
   const topicFacts = searchFactsFTS(opts.messageText, 20).map((h) => h.text);
-  const existingFacts = [...new Set([...profileFacts, ...topicFacts])].slice(0, 40);
+  const existingFacts = [...new Set([...levelFacts, ...profileFacts, ...topicFacts])].slice(0, 50);
 
   let raw: string;
   try {
@@ -252,7 +332,7 @@ export async function extractFromMessage(opts: {
 
   console.log(
     `[extractor] extracted: ${parsed.facts.length} facts, ${parsed.reminders.length} reminders, ` +
-    `${parsed.todoist_tasks.length} tasks, ${parsed.follow_up_reminders.length} follow-ups`,
+    `${parsed.follow_up_reminders.length} follow-ups`,
   );
 
   // --- Explicit reminders ---
@@ -287,24 +367,32 @@ export async function extractFromMessage(opts: {
   for (const fact of parsed.facts) {
     // Pre-insertion similarity guard: skip if an existing fact is nearly identical.
     // Catches cases where the LLM rephrases an existing fact rather than skipping it.
-    try {
-      const nearby = await querySimilarFacts(fact.text, 1);
-      if (nearby.length > 0 && nearby[0].distance < 0.2) {
-        console.log(`[extractor] skip near-duplicate (dist=${nearby[0].distance.toFixed(3)}): "${fact.text.slice(0, 60)}" ≈ "${nearby[0].text.slice(0, 60)}"`);
-        continue;
+    if (!fact.contradicts_hint && !fact.extends_hint) {
+      try {
+        const nearby = await querySimilarFacts(fact.text, 3);
+        const duplicate = nearby.find((hit) => {
+          const existing = getFactById(hit.factId);
+          return existing && existing.is_latest && !existing.is_forgotten && hit.distance < 0.18;
+        });
+        if (duplicate) {
+          console.log(`[extractor] skip near-duplicate (dist=${duplicate.distance.toFixed(3)}): "${fact.text.slice(0, 60)}" ≈ "${duplicate.text.slice(0, 60)}"`);
+          continue;
+        }
+      } catch {
+        // ChromaDB not ready — proceed without guard
       }
-    } catch {
-      // ChromaDB not ready — proceed without guard
     }
 
-    console.log(`[extractor] fact: "${fact.text}" (static=${fact.is_static})`);
+    const forgetAfter = normalizeForgetAfter(fact, opts.documentDate);
+    console.log(`[extractor] fact L${fact.abstraction_level}: "${fact.text}" (static=${fact.is_static})`);
     try {
       const factId = insertFact({
         text: fact.text,
         is_static: fact.is_static,
+        abstraction_level: fact.abstraction_level,
         document_date: opts.documentDate,
         event_date: fact.event_date,
-        forget_after: fact.forget_after,
+        forget_after: forgetAfter,
         source_message_id: opts.messageId || undefined,
       });
 
@@ -318,34 +406,54 @@ export async function extractFromMessage(opts: {
           if (candidates.length > 0) {
             const old = candidates[0];
             insertRelation(factId, old.id, "updates");
-            markSuperseded(old.id);
-            console.log(`[extractor] superseded fact ${old.id}: "${old.text}"`);
+            markSuperseded(old.id, factId, { rewireChildren: false });
+            console.log(`[extractor] updates: fact_${factId} -> fact_${old.id} "${old.text}"`);
           }
         } catch (err) {
           console.error(`[extractor] contradiction resolver failed:`, err);
         }
       }
 
+      if (fact.extends_hint) {
+        try {
+          const candidates = searchFactsFTS(fact.extends_hint, 5).filter((c) => c.id !== factId);
+          if (candidates.length > 0) {
+            const old = candidates[0];
+            insertRelation(factId, old.id, "extends");
+            markSuperseded(old.id, factId, { rewireChildren: true });
+            console.log(`[extractor] extends: fact_${factId} -> fact_${old.id} "${old.text}"`);
+          }
+        } catch (err) {
+          console.error(`[extractor] extension resolver failed:`, err);
+        }
+      }
+
       try {
         const chromaId = await chromaUpsert(factId, fact.text, {
           is_static: fact.is_static,
+          abstraction_level: fact.abstraction_level,
           document_date: opts.documentDate,
           ...(fact.event_date ? { event_date: fact.event_date } : {}),
           user_id: config().USER_ID,
         });
         updateChromaId(factId, chromaId);
+        await wireParent(factId, fact.text, fact.abstraction_level, fact.parent_hint);
+        await wireExistingChildren(factId, fact.text, fact.abstraction_level);
 
         // --- Knowledge graph: auto-wire relates_to edges ---
-        // Query ChromaDB for semantically similar existing facts.
+        // Query ChromaDB for semantically similar same-level existing facts.
         // Distance < 0.12: near-duplicate, skip (already handled by dedup/contradiction)
         // Distance 0.12–0.55: clearly related — create a graph edge
         // Distance > 0.55: too loosely related, skip
         try {
-          const similar = await querySimilarFacts(fact.text, 10);
+          const similar = await querySimilarFacts(fact.text, 10, { abstraction_level: fact.abstraction_level });
           const wired: number[] = [];
           for (const hit of similar) {
             if (hit.factId === factId || hit.factId <= 0) continue;
             if (hit.distance < 0.12 || hit.distance > 0.55) continue;
+            const other = getFactById(hit.factId);
+            if (!other || !other.is_latest || other.is_forgotten) continue;
+            if (other.abstraction_level !== fact.abstraction_level) continue;
             insertRelation(factId, hit.factId, "relates_to");
             wired.push(hit.factId);
           }
@@ -359,55 +467,19 @@ export async function extractFromMessage(opts: {
         console.error(`[extractor] ChromaDB upsert failed for "${fact.text}":`, err);
       }
 
-      try {
-        upsertProfileFact({
-          fact: fact.text,
-          is_static: fact.is_static,
-          source_fact_id: factId,
-        });
-      } catch (err) {
-        console.error(`[extractor] profile upsert failed for "${fact.text}":`, err);
-      }
-    } catch (err) {
-      console.error(`[extractor] insertFact failed for "${fact.text}":`, err);
-    }
-  }
-
-  // --- Implicit Todoist task creation ---
-  for (const task of parsed.todoist_tasks) {
-    try {
-      const created = await createTask({
-        content: task.content,
-        due_string: task.due_string,
-      });
-      if (created) {
-        console.log(`[todoist] created task: "${task.content}"`);
-
-        // Mirror the task as a local reminder so Alfred's proactive engine fires it.
-        // Use the task's due date at 9am, or now+30min if the due date is already today
-        // and 9am has passed.
+      if (fact.abstraction_level > 0) {
         try {
-          let due_at: string;
-          if (created.due?.date) {
-            const nineAm = new Date(`${created.due.date}T09:00:00`);
-            const thirtyMinsFromNow = new Date(Date.now() + 30 * 60 * 1000);
-            due_at = nineAm > new Date() ? nineAm.toISOString() : thirtyMinsFromNow.toISOString();
-          } else {
-            // No due date returned — remind in 30 minutes as a gentle nudge
-            due_at = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-          }
-          insertReminder({
-            text: task.content,
-            due_at,
-            source_message_id: opts.messageId || undefined,
+          upsertProfileFact({
+            fact: fact.text,
+            is_static: fact.is_static,
+            source_fact_id: factId,
           });
-          console.log(`[todoist] reminder set for "${task.content}" at ${due_at}`);
         } catch (err) {
-          console.error(`[extractor] reminder for todoist task failed:`, err);
+          console.error(`[extractor] profile upsert failed for "${fact.text}":`, err);
         }
       }
     } catch (err) {
-      console.error(`[extractor] todoist task creation failed:`, err);
+      console.error(`[extractor] insertFact failed for "${fact.text}":`, err);
     }
   }
 

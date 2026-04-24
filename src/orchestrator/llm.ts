@@ -39,7 +39,9 @@ interface TextToolCall {
 
 function parseTextToolCalls(content: string): TextToolCall[] {
   const calls: TextToolCall[] = [];
-  // Match both <function_calls> and <functioncalls> (some models drop the underscore)
+
+  // Format 1: <function_calls><invoke name="tool"><parameter name="k">v</parameter></invoke></function_calls>
+  // (also <functioncalls> without underscore)
   const blockRe = /<function_?calls>([\s\S]*?)<\/function_?calls>/gi;
   let blockMatch: RegExpExecArray | null;
   while ((blockMatch = blockRe.exec(content)) !== null) {
@@ -58,12 +60,31 @@ function parseTextToolCalls(content: string): TextToolCall[] {
       calls.push({ name, arguments: args });
     }
   }
+
+  // Format 2: <tool_use>\n{"type":"tool_name","param":"value",...}\n</tool_use>
+  const toolUseRe = /<tool_use>\s*([\s\S]*?)\s*<\/tool_use>/gi;
+  let tuMatch: RegExpExecArray | null;
+  while ((tuMatch = toolUseRe.exec(content)) !== null) {
+    try {
+      const obj = JSON.parse(tuMatch[1]) as Record<string, string>;
+      const name = obj["type"] ?? obj["name"];
+      if (!name) continue;
+      const args = { ...obj };
+      delete args["type"];
+      delete args["name"];
+      calls.push({ name, arguments: args });
+    } catch {
+      // malformed JSON — skip
+    }
+  }
+
   return calls;
 }
 
 function stripToolCallXML(text: string): string {
   return text
     .replace(/<function_?calls>[\s\S]*?<\/function_?calls>/gi, "")
+    .replace(/<tool_use>[\s\S]*?<\/tool_use>/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
