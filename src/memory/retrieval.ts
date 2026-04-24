@@ -3,15 +3,19 @@ import {
   getMessageById,
   getActiveDynamicFacts,
   getBedrockFacts,
+  getLevel2Facts,
+  getInstanceOfParents,
   getRelatedFactIds,
   searchFactsFTS,
 } from "./facts.js";
 import { querySimilarFacts } from "./vectors.js";
 
 export interface RetrievedContext {
-  /** 5 foundational static facts — always in every context window */
+  /** Level 2 identity/value facts — always in every context window */
+  identity: string[];
+  /** Top Level 1 patterns by descendant_count — always in every context window */
   bedrock: string[];
-  /** Up to 14 facts retrieved for this specific message + graph-expanded neighbors */
+  /** Query-specific facts plus upward/lateral graph expansion */
   retrieved: string[];
 }
 
@@ -49,11 +53,13 @@ function formatWithSourceChunk(factText: string, sourceMessageId?: number): stri
 }
 
 export async function retrieveContext(queryText: string): Promise<RetrievedContext> {
-  // --- Bedrock: always-on core identity (5 oldest static facts) ---
+  // --- Always-on memory layers ---
+  const identityFacts = getLevel2Facts().slice(0, 10);
+  const identity = identityFacts.map((f) => f.text);
   const bedrockFacts = getBedrockFacts();
   const bedrock = bedrockFacts.map((f) => f.text);
-  const bedrockIds = new Set(bedrockFacts.map((f) => f.id));
-  const bedrockTextSet = new Set(bedrock);
+  const alwaysIds = new Set([...identityFacts, ...bedrockFacts].map((f) => f.id));
+  const alwaysTextSet = new Set([...identity, ...bedrock]);
 
   // --- Hybrid retrieval across ALL active facts ---
   const t0 = Date.now();
@@ -81,15 +87,19 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
     // Score, filter, and rank all candidates
     const candidates = Array.from(merged.entries())
       .map(([factId, rrfScore]) => {
-        if (bedrockIds.has(factId)) return null;
+        if (alwaysIds.has(factId)) return null;
         const fact = getFactById(factId);
         if (!fact || !fact.is_latest || fact.is_forgotten) return null;
         const recency = recencyWeight(fact.document_date);
+        const levelRecencyScale = Math.max(0, 1 - fact.abstraction_level / 2);
         const staticBoost = fact.is_static ? 0.1 : 0;
         // Upcoming events get a boost so they surface for scheduling context
         const upcomingBoost =
           fact.event_date && new Date(fact.event_date) > new Date() ? 0.15 : 0;
-        return { fact, finalScore: rrfScore + recency * 0.1 + staticBoost + upcomingBoost };
+        return {
+          fact,
+          finalScore: rrfScore + recency * 0.1 * levelRecencyScale + staticBoost + upcomingBoost,
+        };
       })
       .filter(Boolean) as Array<{
         fact: NonNullable<ReturnType<typeof getFactById>>;
@@ -99,45 +109,76 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
     candidates.sort((a, b) => b.finalScore - a.finalScore);
     const top10 = candidates.slice(0, 10);
     const retrievedIds = new Set(top10.map(({ fact }) => fact.id));
+    const seenText = new Set(alwaysTextSet);
 
-    // --- Graph expansion: follow relates_to edges from top 5 hits ---
+    // --- Upward expansion: follow instance_of parents for meaning/context ---
     const expansionLines: string[] = [];
+    for (const { fact } of top10.slice(0, 6)) {
+      if (expansionLines.length >= 5) break;
+      const stack = getInstanceOfParents(fact.id).map((id) => ({ id, depth: 1 }));
+      const visited = new Set<number>();
+      while (stack.length > 0 && expansionLines.length < 5) {
+        const item = stack.shift();
+        if (!item || item.depth > 2 || visited.has(item.id)) continue;
+        visited.add(item.id);
+        if (retrievedIds.has(item.id) || alwaysIds.has(item.id)) continue;
+        const parent = getFactById(item.id);
+        if (!parent || !parent.is_latest || parent.is_forgotten || seenText.has(parent.text)) continue;
+        console.log(`[retrieval] upward expand: fact_${fact.id} -> fact_${parent.id} "${parent.text.slice(0, 60)}"`);
+        expansionLines.push(parent.text);
+        retrievedIds.add(parent.id);
+        seenText.add(parent.text);
+        for (const grandparentId of getInstanceOfParents(parent.id)) {
+          stack.push({ id: grandparentId, depth: item.depth + 1 });
+        }
+      }
+    }
+
+    // --- Lateral expansion: limited relates_to hop after upward context ---
     for (const { fact } of top10.slice(0, 5)) {
-      if (expansionLines.length >= 4) break;
+      if (expansionLines.length >= 5) break;
       const relatedIds = getRelatedFactIds(fact.id);
       for (const relId of relatedIds) {
-        if (expansionLines.length >= 4) break;
-        if (retrievedIds.has(relId) || bedrockIds.has(relId)) continue;
+        if (expansionLines.length >= 5) break;
+        if (retrievedIds.has(relId) || alwaysIds.has(relId)) continue;
         const f = getFactById(relId);
-        if (!f || !f.is_latest || f.is_forgotten || bedrockTextSet.has(f.text)) continue;
+        if (!f || !f.is_latest || f.is_forgotten || alwaysTextSet.has(f.text) || seenText.has(f.text)) continue;
         console.log(`[retrieval] graph expand: fact_${fact.id} → fact_${relId} "${f.text.slice(0, 60)}"`);
-        expansionLines.push(formatWithSourceChunk(f.text, f.source_message_id));
+        expansionLines.push(f.text);
         retrievedIds.add(relId);
+        seenText.add(f.text);
       }
     }
 
     retrieved = [
-      ...top10.map(({ fact }) => formatWithSourceChunk(fact.text, fact.source_message_id)),
+      ...top10.map(({ fact }) => {
+        seenText.add(fact.text);
+        return fact.text;
+      }),
       ...expansionLines,
     ];
   } else {
     // Cold start fallback: no ChromaDB yet — pull recent dynamic facts
     retrieved = getActiveDynamicFacts()
-      .filter((f) => !bedrockTextSet.has(f.text))
+      .filter((f) => !alwaysTextSet.has(f.text))
       .slice(0, 12)
-      .map((f) => formatWithSourceChunk(f.text, f.source_message_id));
+      .map((f) => f.text);
   }
 
   const tDone = Date.now();
   console.log(`[retrieval] timings — semantic:${tSemantic - t0}ms fts:${tFTS - tSemantic}ms rank+expand:${tDone - tFTS}ms total:${tDone - t0}ms`);
   console.log(
+    `[retrieval] identity(${identityFacts.length}): ` +
+    identityFacts.map((f) => `"${f.text.slice(0, 40)}" (${f.descendant_count} desc)`).join(", "),
+  );
+  console.log(
     `[retrieval] bedrock(${bedrockFacts.length}): ` +
-    bedrockFacts.map((f) => `"${f.text.slice(0, 40)}" (${f.edge_count ?? 0} edges)`).join(", "),
+    bedrockFacts.map((f) => `"${f.text.slice(0, 40)}" (${f.descendant_count} desc)`).join(", "),
   );
   console.log(
     `[retrieval] retrieved(${retrieved.length}): ` +
     retrieved.map((f) => `"${f.slice(0, 50)}"`).join(" | "),
   );
 
-  return { bedrock, retrieved };
+  return { identity, bedrock, retrieved };
 }

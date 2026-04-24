@@ -67,11 +67,24 @@ function queueForExtraction(text: string, messageId: number): void {
 // closes, Alfred responds once to the combined batch.
 // ---------------------------------------------------------------------------
 const RESPONSE_DEBOUNCE_MS = 1000;
+const PLAIN_RESPONSE_DEBOUNCE_MS = 2000;
 
 interface PendingResponse {
   text: string;
   modePromise: Promise<ResponseMode>;
   receivedAt: number;
+}
+
+function likelyNeedsTool(text: string): boolean {
+  const t = text.toLowerCase();
+  return likelyNeedsTodoist(text) ||
+    /\b(look up|search|google|weather|news|price|current|latest)\b/.test(t) ||
+    /https?:\/\//.test(t);
+}
+
+function likelyNeedsTodoist(text: string): boolean {
+  const t = text.toLowerCase();
+  return /\b(todo|task|to[- ]?do|due|overdue|caught up|anything i need to do|what do i have|schedule|remind|reminder)\b/.test(t);
 }
 
 async function main(): Promise<void> {
@@ -116,13 +129,11 @@ async function main(): Promise<void> {
     // Combine all messages into one context string
     const combinedText = batch.map((m) => m.text).join("\n");
 
-    // Resolve classifier + retrieval in parallel
+    // Resolve the response gate first. Most messages should not get a reply;
+    // avoid doing retrieval/tool context work when Alfred is going to stay quiet.
     const wallStart = batch[0].receivedAt;
     const t0 = Date.now();
-    const [modes, contextData] = await Promise.all([
-      Promise.all(batch.map((m) => m.modePromise)),
-      fetchContext(buffer),
-    ]);
+    const modes = await Promise.all(batch.map((m) => m.modePromise));
 
     // Escalate to the highest-priority mode across all messages
     const mode: ResponseMode =
@@ -133,7 +144,10 @@ async function main(): Promise<void> {
 
     console.log(`[alfred] responding to ${batch.length} message(s) as ${mode} | input: "${combinedText.slice(0, 80)}"`);
 
-    if (mode === "silent") return;
+    if (mode === "silent") {
+      console.log(`[alfred] no response sent (classifier=silent)`);
+      return;
+    }
 
     if (mode === "acknowledge") {
       const recentForAck = buffer.getRecent(4).map((m) => ({
@@ -146,14 +160,25 @@ async function main(): Promise<void> {
     }
 
     try {
+      const includeTodoist = mode === "full" && likelyNeedsTodoist(combinedText);
+      const allowTools = mode === "full" && likelyNeedsTool(combinedText);
+      const contextData = await fetchContext(buffer, { includeTodoist });
       const systemPrompt = buildPrompt(contextData, mode);
       const tContext = Date.now();
-      const reply = await chat(systemPrompt, combinedText, async () => {
-        const ack = SEARCH_ACKS[Math.floor(Math.random() * SEARCH_ACKS.length)];
-        console.log(`[alfred] web search ack: "${ack}"`);
-        await sendBubbles(sdk, ack);
+      const reply = await chat(systemPrompt, combinedText, {
+        allowTools,
+        maxTokens: mode === "brief" ? 120 : 200,
+        onWebSearch: async () => {
+          const ack = SEARCH_ACKS[Math.floor(Math.random() * SEARCH_ACKS.length)];
+          console.log(`[alfred] web search ack: "${ack}"`);
+          await sendBubbles(sdk, ack);
+        },
       });
       const tLLM = Date.now();
+      if (!reply || reply.trim() === "__NO_RESPONSE__") {
+        console.log(`[alfred] no response sent (llm=${reply || "empty"})`);
+        return;
+      }
       await sendBubbles(sdk, reply);
       const tSend = Date.now();
       console.log(`[alfred] timings — classify+context:${tContext - t0}ms llm:${tLLM - tContext}ms send:${tSend - tLLM}ms total:${tSend - t0}ms wall:${tSend - wallStart}ms`);
@@ -169,14 +194,14 @@ async function main(): Promise<void> {
     }
   }
 
-  function scheduleResponse(text: string, modePromise: Promise<ResponseMode>, receivedAt: number): void {
+  function scheduleResponse(text: string, modePromise: Promise<ResponseMode>, receivedAt: number, debounceMs: number): void {
     pendingResponses.push({ text, modePromise, receivedAt });
     if (responseTimer) clearTimeout(responseTimer);
     responseTimer = setTimeout(() => {
       flushResponseBuffer().catch((err) =>
         console.error("[alfred] flush error:", err),
       );
-    }, RESPONSE_DEBOUNCE_MS);
+    }, debounceMs);
   }
 
   // Start watching for messages
@@ -276,7 +301,11 @@ async function main(): Promise<void> {
 
         // Queue for debounced response — resets timer if user sends another
         // message within RESPONSE_DEBOUNCE_MS (simulates typing detection)
-        scheduleResponse(effectiveText, modePromise, receivedAt);
+        const hasProcessedAttachment = type === "audio" || type === "image" || type === "file";
+        const debounceMs = hasProcessedAttachment || likelyNeedsTool(effectiveText)
+          ? RESPONSE_DEBOUNCE_MS
+          : PLAIN_RESPONSE_DEBOUNCE_MS;
+        scheduleResponse(effectiveText, modePromise, receivedAt, debounceMs);
 
         // Fire any due reminders triggered by this message
         checkDueReminders(sdk);
