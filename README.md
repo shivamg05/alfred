@@ -14,9 +14,10 @@ An AI journal and second brain that lives natively in iMessage. Text it notes, v
 
 **Memory that compounds**
 - Every message is decomposed into atomic facts and embedded
-- Facts expire automatically if they're temporary ("has a deadline next week")
-- Contradictions are detected and old facts superseded ("moved to Austin" replaces "lives in NYC")
-- Hybrid retrieval: semantic similarity + recency decay + static fact boost
+- Facts are organized into three abstraction levels: events/state, patterns, identity/values
+- Temporary level-0 facts expire and consolidate into durable patterns when repeated
+- Contradictions and refinements preserve history through directed graph edges
+- Hybrid retrieval: identity anchors + structural bedrock + semantic/keyword detail + graph expansion
 
 **Proactive (not just reactive)**
 - 9am morning brief: what's on your plate today
@@ -60,13 +61,13 @@ Background: extract facts + reminders + Todoist tasks from message
 | Working | Active reminders + user profile | SQLite |
 | Long-term | Every extracted fact, embedded | ChromaDB (local) |
 
-### Retrieval scoring
+### Retrieval layers
 
-```
-score = semantic_similarity × 0.5
-      + recency_weight (exp decay, 30d halflife) × 0.3
-      + is_static_boost × 0.2
-```
+1. Core identity: latest level-2 facts, always injected once
+2. Foundational patterns: level-1 facts ranked by descendant count
+3. Relevant detail: ChromaDB semantic search + SQLite FTS5 merged with RRF
+4. Upward graph expansion: retrieved details pull in `instance_of` parents
+5. Lateral graph expansion: small same-level `relates_to` budget
 
 ### Folder structure
 
@@ -84,6 +85,7 @@ src/
     facts.ts                  ← SQLite CRUD
     vectors.ts                ← ChromaDB client (OpenAI embeddings)
     extractor.ts              ← background LLM extraction
+    consolidation.ts          ← expiry + pattern/identity promotion
     resolver.ts               ← contradiction detection
     retrieval.ts              ← hybrid retrieval + re-ranking
   orchestrator/
@@ -188,8 +190,8 @@ EXTRACTION_MODEL=gemini-2.0-flash
 ```sql
 messages          -- raw messages + transcripts/summaries
 memory_facts      -- atomic facts extracted from messages
-                  -- (versioned: root_fact_id, parent_fact_id, is_latest)
-fact_relations    -- typed relations: updates | extends | derives
+                  -- abstraction_level, descendant_count, is_latest, is_forgotten
+fact_relations    -- typed relations: instance_of | relates_to | updates | extends | derives | consolidated_from
 reminders         -- due_at reminders, fired_at tracking
 user_profile      -- materialized static + dynamic facts about the user
 proactive_log     -- log of every proactive message sent

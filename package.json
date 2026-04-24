@@ -12,6 +12,9 @@
     "memory": "tsx scripts/memory-graph.ts",
     "memory:static": "tsx scripts/memory-graph.ts --static",
     "memory:dynamic": "tsx scripts/memory-graph.ts --dynamic",
+    "memory:viz": "tsx scripts/memory-viz.ts",
+    "memory:rewire": "tsx scripts/rewire-memory-parents.ts",
+    "memory:reset": "tsx scripts/reset-memory.ts",
     "backfill-graph": "tsx scripts/backfill-graph.ts"
   },
   "keywords": [],

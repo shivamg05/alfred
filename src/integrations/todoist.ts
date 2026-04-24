@@ -5,7 +5,7 @@ const BASE = "https://api.todoist.com/api/v1";
 export interface TodoistTask {
   id: string;
   content: string;
-  due?: { string: string; date: string };
+  due?: { string: string; date: string; datetime?: string; is_recurring?: boolean };
   priority: number;  // 1 (normal) to 4 (urgent)
   project_id: string;
 }
@@ -25,21 +25,107 @@ export async function getTasks(filter?: string): Promise<TodoistTask[]> {
   if (!token) return [];
 
   try {
-    const url = filter
-      ? `${BASE}/tasks?filter=${encodeURIComponent(filter)}`
-      : `${BASE}/tasks`;
-    const res = await fetch(url, { headers: headers() });
-    if (!res.ok) throw new Error(`Todoist API ${res.status}`);
-    const body = await res.json();
-    // v1 API returns { results: [...], next_cursor: ... }; v2 returned a bare array
-    const tasks = Array.isArray(body) ? body : (body?.results ?? []);
-    // Only update the main cache for unfiltered fetches
-    if (!filter) _rawTaskCache = tasks as TodoistTask[];
-    return tasks as TodoistTask[];
+    const normalized = normalizeKnownFilter(filter);
+    const tasks = normalized
+      ? localFilterTasks(await fetchAllTasks(), normalized)
+      : await fetchAllTasks(filter);
+    if (!filter) _rawTaskCache = tasks;
+    return sortTasks(tasks);
   } catch (err) {
     console.error("[todoist] failed to fetch tasks:", err);
     return [];
   }
+}
+
+async function fetchAllTasks(filter?: string): Promise<TodoistTask[]> {
+  const tasks: TodoistTask[] = [];
+  let cursor: string | null = null;
+  do {
+    const params = new URLSearchParams();
+    if (filter) params.set("filter", filter);
+    if (cursor) params.set("cursor", cursor);
+    const qs = params.toString();
+    const res = await fetch(`${BASE}/tasks${qs ? `?${qs}` : ""}`, { headers: headers() });
+    if (!res.ok) throw new Error(`Todoist API ${res.status}`);
+    const body = await res.json();
+    if (Array.isArray(body)) {
+      tasks.push(...body as TodoistTask[]);
+      break;
+    }
+    tasks.push(...(body?.results ?? []) as TodoistTask[]);
+    cursor = body?.next_cursor ?? null;
+  } while (cursor);
+  if (!filter) _rawTaskCache = tasks;
+  return tasks;
+}
+
+type KnownFilter = "today_overdue" | "today" | "overdue" | "week";
+
+function normalizeKnownFilter(filter?: string): KnownFilter | null {
+  const f = filter?.toLowerCase().trim();
+  if (!f) return null;
+  if (f === "today | overdue" || f === "overdue | today") return "today_overdue";
+  if (f === "today") return "today";
+  if (f === "overdue") return "overdue";
+  if (f === "due before: +7 days" || f.includes("+7 days") || f.includes("next 7")) return "week";
+  return null;
+}
+
+function localDateString(d = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: config().USER_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const day = parts.find((p) => p.type === "day")?.value;
+  return `${y}-${m}-${day}`;
+}
+
+function addDays(date: string, days: number): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function dueDate(task: TodoistTask): string | null {
+  return task.due?.date ?? task.due?.datetime?.slice(0, 10) ?? null;
+}
+
+function localFilterTasks(tasks: TodoistTask[], filter: KnownFilter): TodoistTask[] {
+  const today = localDateString();
+  const inSevenDays = addDays(today, 7);
+  return tasks.filter((task) => {
+    const due = dueDate(task);
+    if (!due) return false;
+    if (filter === "today") return due === today;
+    if (filter === "overdue") return due < today;
+    if (filter === "today_overdue") return due <= today;
+    if (filter === "week") return due <= inSevenDays;
+    return true;
+  });
+}
+
+function taskUrgency(task: TodoistTask): number {
+  const today = localDateString();
+  const due = dueDate(task);
+  if (!due) return 4;
+  if (due < today) return 0;
+  if (due === today) return 1;
+  return 2;
+}
+
+function sortTasks(tasks: TodoistTask[]): TodoistTask[] {
+  return [...tasks].sort((a, b) => {
+    const urgency = taskUrgency(a) - taskUrgency(b);
+    if (urgency !== 0) return urgency;
+    const dueA = dueDate(a) ?? "9999-12-31";
+    const dueB = dueDate(b) ?? "9999-12-31";
+    if (dueA !== dueB) return dueA.localeCompare(dueB);
+    return b.priority - a.priority;
+  });
 }
 
 /** Returns the last-fetched task list without making a network request. */

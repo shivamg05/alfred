@@ -14,8 +14,8 @@ export async function resolveContradiction(
       const existing = getFactById(hit.factId);
       if (!existing) continue;
 
-      markSuperseded(hit.factId);
       insertRelation(newFactId, hit.factId, "updates");
+      markSuperseded(hit.factId, newFactId, { rewireChildren: false });
 
       console.log(`[resolver] fact ${newFactId} supersedes fact ${hit.factId}: "${existing.text}"`);
       break;

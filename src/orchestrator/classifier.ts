@@ -18,18 +18,18 @@ function extractJSON(s: string): string {
 
 const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "acknowledge" | "brief" | "full" }
 
-silent — pure reaction, nothing to confirm or engage with.
-  → "lol", "fr", "damn", "ok", "ya true", "deadass", "bet", "💀"
+silent — pure reaction, throwaway text, or nothing to confirm or engage with.
+  → "lol", "fr", "damn", "ok", "ya true", "deadass", "bet", "💀", "that was crazy"
 
-acknowledge — explicit command to record/note something, or user explicitly says they don't want engagement.
+acknowledge — explicit command to record/note/do something, or the user clearly only wants receipt confirmation.
   → "remind me to call mom tomorrow" / "note that i have a meeting at 3" / "i don't wanna talk about it" / "just fyi i'm heading out"
   NOT acknowledge: venting, sharing news, updates about their life, anything that opens a topic
 
-brief — sharing something, venting, starting a topic, or updating alfred on their life. Invites a natural reaction or follow-up.
+brief — sharing something, venting, starting a topic, emotionally addressing Alfred, or updating Alfred on their life. Invites a natural reaction or follow-up, but does not need tools.
   → "work has been crazy" / "kinda nervous about tomorrow" / "just finished the project" / "my summer is split into 3 tracks" / "i'm so tired of this" / "just got back from the gym"
 
-full — explicit question, request, or asking alfred to do/look up/check something.
-  → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?" / "where am I?" / "tell me X"
+full — explicit question, request, or asking Alfred to do/look up/check something.
+  → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?" / "where am I?" / "tell me X" / "find me X"
 
 When the conversation context shows a prior question or request, treat follow-ups as full.
 Default to brief if unsure.`;

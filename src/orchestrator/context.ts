@@ -13,7 +13,7 @@ async function getTaskContext(): Promise<string> {
   if (!config().TODOIST_API_TOKEN) return "";
   const now = Date.now();
   if (now - _lastTaskFetch > TASK_CACHE_MS) {
-    const tasks = await getTasks();
+    const tasks = await getTasks("due before: +7 days");
     _cachedTasksStr = formatTasksForContext(tasks);
     _lastTaskFetch = now;
   }
@@ -26,15 +26,22 @@ export interface ContextData {
   todoistTasks: string;
 }
 
+export interface FetchContextOptions {
+  includeTodoist?: boolean;
+}
+
 /** Retrieval only — mode-independent. Safe to run in parallel with classifyIntent. */
-export async function fetchContext(buffer: ConversationBuffer): Promise<ContextData> {
+export async function fetchContext(
+  buffer: ConversationBuffer,
+  opts: FetchContextOptions = {},
+): Promise<ContextData> {
   const recentMessages = buffer.getRecent(20);
   const latestUserMsg =
     recentMessages.filter((m) => m.role === "user").at(-1)?.content ?? "";
 
   const [memoryContext, todoistTasks] = await Promise.all([
     retrieveContext(latestUserMsg),
-    getTaskContext(),
+    opts.includeTodoist ? getTaskContext() : Promise.resolve(""),
   ]);
 
   return { memoryContext, recentMessages, todoistTasks };
@@ -44,7 +51,8 @@ export async function fetchContext(buffer: ConversationBuffer): Promise<ContextD
 export function buildPrompt(data: ContextData, mode: ResponseMode): string {
   console.log(
     `[context] mode=${mode} history=${data.recentMessages.length}msgs ` +
-    `bedrock=${data.memoryContext.bedrock.length} retrieved=${data.memoryContext.retrieved.length} ` +
+    `identity=${data.memoryContext.identity.length} bedrock=${data.memoryContext.bedrock.length} ` +
+    `retrieved=${data.memoryContext.retrieved.length} ` +
     `todoist=${data.todoistTasks ? "yes" : "no"}`,
   );
   return buildSystemPrompt(data.memoryContext, data.recentMessages, data.todoistTasks, mode);

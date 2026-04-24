@@ -60,6 +60,7 @@ insertMessage() → SQLite messages table
            │
            ├─ facts → insertFact() → SQLite
            │       → ChromaDB upsert (OpenAI embedding)
+           │       → graph wiring: updates/extends/instance_of/relates_to
            │       → upsertProfileFact() → user_profile
            ├─ reminders → insertReminder() → SQLite
            └─ todoist_tasks → Todoist REST API
@@ -80,6 +81,8 @@ Alfred uses **atomic fact extraction** inspired by [supermemory.ai](https://supe
 - Each message is decomposed into discrete, self-contained facts
 - Facts are embedded individually (not the raw message)
 - Facts can be versioned and superseded via `fact_relations`
+- Facts are organized into levels: specific event/state (`0`), pattern (`1`), identity/value (`2`)
+- Expired level-0 facts can consolidate into higher-level patterns rather than simply disappear
 
 ### Three tiers
 
@@ -93,11 +96,13 @@ Alfred uses **atomic fact extraction** inspired by [supermemory.ai](https://supe
 - `reminders` — unfired reminders due within the next hour
 - Queried synchronously via `better-sqlite3`
 
-**Tier 3: Long-term semantic memory (ChromaDB)**
+**Tier 3: Long-term semantic memory (SQLite graph + ChromaDB)**
 - Every extracted fact, embedded with `text-embedding-3-small`
-- Queried at response time with the incoming message as the query
-- Top 10 candidates re-ranked by: `semantic(0.5) + recency_decay(0.3) + static_boost(0.2)`
-- Top 5 injected into the context window
+- Query-specific retrieval uses ChromaDB semantic search + SQLite FTS5 merged with RRF
+- Always-on context includes level-2 identity anchors and level-1 bedrock patterns
+- Retrieved details expand upward through `instance_of` parents, then laterally via `relates_to`
+
+See [memory.md](./memory.md) for the detailed memory graph architecture.
 
 ### Fact schema
 
@@ -105,6 +110,8 @@ Alfred uses **atomic fact extraction** inspired by [supermemory.ai](https://supe
 memory_facts
   id                   INTEGER PK
   text                 TEXT     — self-contained, third-person ("User is building...")
+  abstraction_level    INTEGER  — 0=event/state, 1=pattern, 2=identity/value
+  descendant_count     INTEGER  — cached subtree support count
   root_fact_id         INTEGER  — original fact in a contradiction chain
   parent_fact_id       INTEGER  — the fact this one supersedes
   is_latest            BOOL     — false when a newer fact supersedes this
@@ -118,11 +125,12 @@ memory_facts
 
 ### Contradiction detection
 
-When the extractor LLM detects that a new fact supersedes an old one, it includes a `contradicts_hint` in its output. The resolver:
+When the extractor LLM detects that a new fact supersedes or refines an old one, it includes a `contradicts_hint` or `extends_hint` in its output. The resolver:
 
-1. Embeds the hint and queries ChromaDB for similar existing facts
-2. If similarity > 0.80, marks the old fact `is_latest = false`
-3. Writes a `fact_relations` row with `relation_type = 'updates'`
+1. Searches existing facts for the hinted old fact
+2. Writes an `updates` or `extends` relation from the new fact to the old fact
+3. Marks the old fact `is_latest = false`
+4. Rewires children only for `extends`; `updates` keeps old children attached as historical evidence
 
 Result: "User moved to Austin" supersedes "User lives in NYC" rather than coexisting.
 

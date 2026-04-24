@@ -144,4 +144,17 @@ function applySchema(db: Database.Database): void {
     `);
     db.pragma("user_version = 2");
   }
+
+  if (schemaVersion < 3) {
+    // Add abstraction levels and descendant counts for the hierarchical memory model.
+    // abstraction_level: 0=specific event/state, 1=behavioral pattern, 2=identity/values
+    // descendant_count: total facts in this node's subtree via instance_of edges (maintained incrementally)
+    db.exec(`
+      ALTER TABLE memory_facts ADD COLUMN abstraction_level INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE memory_facts ADD COLUMN descendant_count INTEGER NOT NULL DEFAULT 0;
+      CREATE INDEX IF NOT EXISTS idx_facts_level
+        ON memory_facts(user_id, abstraction_level, is_latest, is_forgotten);
+    `);
+    db.pragma("user_version = 3");
+  }
 }

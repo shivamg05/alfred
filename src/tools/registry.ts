@@ -48,12 +48,14 @@ const TODOIST_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       description: `List the user's Todoist tasks. Always call this before closing or updating a task — you need the task ID.
 
 Use the right filter for the intent:
-- User asks if they finished everything / are all caught up / did everything today → filter: "today | overdue"
+- User asks if they finished everything / are all caught up / did everything today → filter: "due before: +7 days"
 - User asks about overdue / late / behind / past-due tasks → filter: "overdue"
 - User asks what's due today / today's tasks → filter: "today"
 - User asks what's coming up / due soon / this week → filter: "due before: +7 days"
-- User asks about everything on their plate → filter: "today | overdue" (don't list all tasks — that includes far-future items)
+- User asks about everything on their plate → filter: "due before: +7 days" (don't list all tasks — that includes far-future items)
 - You need a task ID to act on a specific task → call with the narrowest filter that will find it
+
+Tool results are sectioned by urgency. In the final reply, mention overdue first, due today second, and upcoming-this-week only if useful. Do not summarize far-future tasks for today/catch-up questions.
 
 Only omit the filter when the user explicitly wants to see ALL tasks including far-future ones.`,
       parameters: {
@@ -62,7 +64,7 @@ Only omit the filter when the user explicitly wants to see ALL tasks including f
           filter: {
             type: "string",
             description:
-              "Todoist filter string. Use 'today | overdue' for completeness checks. Use 'overdue' for past-due queries. Use 'today' for today-only. Use 'due before: +7 days' for upcoming. Omit only when all tasks including far-future ones are wanted.",
+              "Todoist filter string. Use 'due before: +7 days' for completeness/check-in queries. Use 'today | overdue' only for strictly today plus overdue. Use 'overdue' for past-due queries. Use 'today' for today-only. Omit only when all tasks including far-future ones are wanted.",
           },
         },
         required: [],

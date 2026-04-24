@@ -3,7 +3,65 @@ import {
   closeTask,
   updateTask,
   createTask,
+  TodoistTask,
 } from "../integrations/todoist.js";
+import { config } from "../config.js";
+
+function localDateString(d = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: config().USER_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  return `${parts.find((p) => p.type === "year")?.value}-${parts.find((p) => p.type === "month")?.value}-${parts.find((p) => p.type === "day")?.value}`;
+}
+
+function addDays(date: string, days: number): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function dueDate(task: TodoistTask): string | null {
+  return task.due?.date ?? task.due?.datetime?.slice(0, 10) ?? null;
+}
+
+function formatTask(task: TodoistTask): string {
+  const due = task.due ? `due: ${task.due.string}` : "no due date";
+  const priority = task.priority >= 4 ? " | priority: urgent" : task.priority >= 3 ? " | priority: high" : "";
+  return `id:${task.id} | ${task.content} (${due}${priority})`;
+}
+
+function formatTaskSections(tasks: TodoistTask[], filter?: string): string {
+  if (!filter) {
+    return `ALL OPEN TASKS:\n${tasks.map(formatTask).join("\n")}`;
+  }
+  const today = localDateString();
+  const soon = addDays(today, 7);
+  const overdue = tasks.filter((t) => {
+    const due = dueDate(t);
+    return due && due < today;
+  });
+  const dueToday = tasks.filter((t) => dueDate(t) === today);
+  const upcoming = tasks.filter((t) => {
+    const due = dueDate(t);
+    return due && due > today && due <= soon;
+  });
+
+  const sections: string[] = [];
+  sections.push("Use this priority order in your reply: overdue first, due today second, upcoming this week third. Do not mention far-future tasks unless the user asked for all tasks.");
+  if (overdue.length > 0) sections.push(`OVERDUE:\n${overdue.map(formatTask).join("\n")}`);
+  if (dueToday.length > 0) sections.push(`DUE TODAY:\n${dueToday.map(formatTask).join("\n")}`);
+  if (upcoming.length > 0 && filter?.toLowerCase().includes("7")) {
+    sections.push(`UPCOMING THIS WEEK:\n${upcoming.map(formatTask).join("\n")}`);
+  }
+  if (overdue.length === 0 && dueToday.length === 0 && (!filter?.toLowerCase().includes("7") || upcoming.length === 0)) {
+    sections.push("No overdue or due-today tasks found.");
+  }
+
+  return sections.join("\n\n");
+}
 
 /**
  * Execute a todoist_* tool call.
@@ -22,12 +80,7 @@ export async function executeTodoistTool(
           ? `No tasks match filter "${args.filter}".`
           : "No open tasks.";
       }
-      return tasks
-        .map(
-          (t) =>
-            `id:${t.id} | ${t.content}${t.due ? ` (due: ${t.due.string})` : ""}`,
-        )
-        .join("\n");
+      return formatTaskSections(tasks, args.filter);
     }
 
     if (name === "todoist_close_task") {

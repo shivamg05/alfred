@@ -6,8 +6,14 @@ import { config } from "../config.js";
  * (haiku) often ignore them: no trailing periods, max 2 bubbles.
  */
 function cleanBubble(text: string): string {
+  const noMarkdown = text
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/_([^_]+)_/g, "$1")
+    .replace(/`([^`]+)`/g, "$1");
   // Strip trailing period (but not "..." ellipsis or URLs)
-  return text.replace(/(?<!\.)\.(\s*)$/, "$1").trim();
+  return noMarkdown.replace(/(?<!\.)\.(\s*)$/, "$1").trim();
 }
 
 export async function sendBubbles(sdk: IMessageSDK, text: string): Promise<void> {

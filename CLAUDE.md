@@ -41,7 +41,8 @@ iMessage messages arrive via the imessage-kit WAL watcher → routed by type (te
 | `src/memory/facts.ts` | All SQLite reads/writes for facts, reminders, profile, proactive log. Includes `searchFactsFTS()` |
 | `src/memory/vectors.ts` | ChromaDB client. Uses `text-embedding-3-small` via OpenRouter (or direct OpenAI if key is native) |
 | `src/memory/extractor.ts` | Session-based extraction: 5-category prompt, dedup via existing profile injection, contradiction resolver |
-| `src/memory/retrieval.ts` | Hybrid retrieval: ChromaDB semantic + FTS5 BM25 merged via RRF, with graph expansion and source chunk injection |
+| `src/memory/retrieval.ts` | Layered retrieval: identity anchors, bedrock patterns, RRF detail, upward `instance_of` expansion, source chunks |
+| `src/memory/consolidation.ts` | Periodic memory consolidation: expires level-0 facts, promotes clusters into level-1/level-2 memories |
 | `src/orchestrator/context.ts` | `fetchContext()` (retrieval, mode-independent) + `buildPrompt()` (assembles system prompt) |
 | `src/orchestrator/classifier.ts` | Intent classifier: `silent \| brief \| full`. Fires non-blocking in parallel with retrieval. 5s timeout. |
 | `src/orchestrator/llm.ts` | Multi-iteration tool-calling loop (max 8 turns). Tools run in parallel via Promise.all |
@@ -65,20 +66,24 @@ Three tiers assembled into every context window:
 
 ### Knowledge graph
 
-Facts are nodes; `fact_relations` rows are edges. Edge types: `relates_to` (semantic similarity), `updates` (contradiction resolved), `extends`, `derives`. Edges are stored in canonical order (`min(a,b)` as `fact_id_a`) to prevent duplicates.
+Facts are immutable nodes with `abstraction_level`: `0` specific event/state/plan, `1` behavioral pattern, `2` identity/value. `fact_relations` rows are edges. `relates_to` is undirected and canonicalized; all other edge types are directed with `fact_id_a = source`, `fact_id_b = target`. `instance_of` is vertical and adjacent-level only (`L0 -> L1`, `L1 -> L2`). `updates` keeps old children as history; `extends` rewires children to the refined fact. Full rules are in `docs/memory.md`.
 
-**Bedrock facts** — the 5 most-connected nodes, scored by `edge_count / (1 + age_days * 0.05)`. Always injected into every context window regardless of the query.
+**Identity facts** — latest level-2 facts, always injected once as core identity.
 
-**Graph expansion** — after RRF retrieval, the top 5 hits are 1-hop expanded via `relates_to` edges, adding up to 4 neighbor facts.
+**Bedrock facts** — top level-1 patterns ranked by `descendant_count / (1 + age_days * 0.05)`. Always injected as foundational patterns.
+
+**Graph expansion** — after RRF retrieval, top hits first walk upward through `instance_of` parents, then use a small `relates_to` lateral budget.
 
 ### Extraction (session-based)
 
 Messages are buffered (up to 5, or 2 min idle) then extracted as a batch. The extractor:
 - Injects existing profile facts + FTS-matched topical facts so the model skips near-duplicates
 - Pre-insertion guard: skips facts with ChromaDB distance < 0.15 to an existing fact
-- Auto-wires `relates_to` edges for new facts with similarity 0.12–0.55 to existing facts
+- Assigns `abstraction_level` and enforces `forget_after` only for level-0 facts
+- Auto-wires `instance_of` parent edges via hints/semantic parent search
+- Auto-wires same-level `relates_to` edges for new facts with similarity 0.12–0.55 to existing facts
 - Extracts across 5 categories: Profile, Current Context, Preferences, Events, Updates
-- Runs a contradiction resolver: facts with `contradicts_hint` mark old fact `is_latest = 0`
+- Handles `contradicts_hint` as `updates` and `extends_hint` as `extends`
 - Mirrors every created Todoist task as a local reminder
 
 ### Retrieval (hybrid RRF)
@@ -124,9 +129,9 @@ message arrives
 
 ```
 messages            — raw + transcript/summary, imessage_row_id
-memory_facts        — atomic facts, versioned (is_latest), is_static, forget_after, chroma_id
+memory_facts        — atomic facts, abstraction_level, descendant_count, is_latest, forget_after, chroma_id
 memory_facts_fts    — FTS5 virtual table (auto-synced via triggers)
-fact_relations      — relates_to | updates | extends | derives (canonical min/max ordering)
+fact_relations      — instance_of | relates_to | updates | extends | derives | consolidated_from
 reminders           — due_at, fired_at (includes mirrored Todoist tasks)
 user_profile        — materialized static + dynamic facts (key/value)
 proactive_log       — what Alfred sent unprompted and when

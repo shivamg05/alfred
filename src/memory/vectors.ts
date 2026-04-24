@@ -14,7 +14,6 @@ class OpenAIEmbeddings implements EmbeddingFunction {
 
   async generate(texts: string[]): Promise<number[][]> {
     const cfg = config();
-    // OpenRouter uses namespaced model IDs; OpenAI uses bare names.
     const model = cfg.LLM_BASE_URL ? "openai/text-embedding-3-small" : "text-embedding-3-small";
     const response = await this.client.embeddings.create({ model, input: texts });
     return response.data.map((d) => d.embedding);
@@ -48,7 +47,11 @@ export async function factsCollection(): Promise<Collection> {
   return _collection;
 }
 
-export async function upsertFact(factId: number, text: string, metadata: Record<string, string | number | boolean>): Promise<string> {
+export async function upsertFact(
+  factId: number,
+  text: string,
+  metadata: Record<string, string | number | boolean>,
+): Promise<string> {
   const collection = await factsCollection();
   const id = `fact_${factId}`;
   await collection.upsert({
@@ -71,7 +74,8 @@ export async function embedUnindexedFacts(): Promise<void> {
 
   const unindexed = db()
     .prepare(
-      `SELECT id, text, is_static, document_date, event_date
+      `SELECT id, text, is_static, document_date, event_date,
+              COALESCE(abstraction_level, 1) AS abstraction_level
        FROM memory_facts
        WHERE user_id = ? AND is_latest = 1 AND is_forgotten = 0
          AND (chroma_id IS NULL OR chroma_id = '')
@@ -80,6 +84,7 @@ export async function embedUnindexedFacts(): Promise<void> {
     .all(userId) as Array<{
       id: number; text: string; is_static: number;
       document_date: string; event_date: string | null;
+      abstraction_level: number;
     }>;
 
   if (unindexed.length === 0) return;
@@ -98,14 +103,14 @@ export async function embedUnindexedFacts(): Promise<void> {
         documents: batch.map((f) => f.text),
         metadatas: batch.map((f) => ({
           is_static: f.is_static === 1,
+          abstraction_level: f.abstraction_level,
           document_date: f.document_date,
           user_id: userId,
           ...(f.event_date ? { event_date: f.event_date } : {}),
         })),
       });
       for (const f of batch) {
-        db().prepare("UPDATE memory_facts SET chroma_id = ? WHERE id = ?")
-          .run(`fact_${f.id}`, f.id);
+        db().prepare("UPDATE memory_facts SET chroma_id = ? WHERE id = ?").run(`fact_${f.id}`, f.id);
       }
       console.log(`[vectors] indexed facts ${batch[0].id}–${batch[batch.length - 1].id}`);
     } catch (err) {
@@ -121,14 +126,35 @@ export interface SemanticHit {
   metadata: Record<string, unknown>;
 }
 
+/**
+ * Query ChromaDB for semantically similar facts.
+ *
+ * @param queryText  - Text to embed and search against
+ * @param n          - Max results to return (ChromaDB may return fewer when filtering)
+ * @param whereFilter - Optional metadata filter, e.g. { abstraction_level: 1 }
+ *                      Uses ChromaDB's $eq operator internally.
+ */
 export async function querySimilarFacts(
   queryText: string,
   n = 10,
+  whereFilter?: Partial<Record<string, string | number | boolean>>,
 ): Promise<SemanticHit[]> {
   const collection = await factsCollection();
+
+  // Build ChromaDB where clause from simple key/value pairs
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let where: Record<string, any> | undefined;
+  if (whereFilter && Object.keys(whereFilter).length > 0) {
+    const conditions = Object.entries(whereFilter).map(([key, value]) => ({
+      [key]: { $eq: value },
+    }));
+    where = conditions.length === 1 ? conditions[0] : { $and: conditions };
+  }
+
   const results = await collection.query({
     queryTexts: [queryText],
     nResults: n,
+    ...(where ? { where } : {}),
   });
 
   const ids = results.ids[0] ?? [];
