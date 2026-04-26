@@ -62,6 +62,7 @@ Facts are not edited in place. Corrections, refinements, and consolidations crea
    - level 2 has no parent
    - when a new level 1/2 fact is inserted, Alfred also searches downward for existing lower-level children that were extracted before the parent existed
    - `instance_of` edges update `descendant_count` on parents and ancestors
+   - the delta applied is `1 + child.descendant_count` so the full subtree size propagates upward, not just +1 per edge
 
 7. Lateral wiring:
    - same-level Chroma hits with distance `0.12..0.55` get `relates_to`
@@ -76,7 +77,7 @@ Rules:
 - dated event/plan: expires about 24 hours after `event_date`
 - level 1 and level 2 facts do not expire by time
 
-A consolidation cron runs every 6 hours:
+A consolidation cron runs every 6 hours (at :17 past, to avoid the hour boundary):
 
 1. Select expired level 0 facts where `is_latest = 1`.
 2. Cluster them by semantic similarity.

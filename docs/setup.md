@@ -7,9 +7,10 @@
 | macOS | Required — iMessage is Mac-only |
 | Node.js 20+ | [nodejs.org](https://nodejs.org) or `brew install node` |
 | pnpm | `npm install -g pnpm` |
-| ffmpeg | `brew install ffmpeg` |
 | pipx | `brew install pipx && pipx ensurepath` |
 | ChromaDB | `pipx install chromadb` |
+
+> **No ffmpeg needed.** Audio transcription uses macOS's built-in `afconvert` (CAF→WAV) and Gemini Flash via chat completions. Image handling uses the `heic-convert` npm package.
 
 ---
 
@@ -83,8 +84,11 @@ Edit `.env`:
 ALFRED_PHONE=yourbot@gmail.com        # The Apple ID from Step 1
 USER_PHONE=+1xxxxxxxxxx               # Your personal phone number
 
-# AI — get a key at platform.openai.com
-OPENAI_API_KEY=sk-...
+# AI — get a key at openrouter.ai (recommended) or platform.openai.com
+OPENAI_API_KEY=sk-or-...
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=anthropic/claude-haiku-4-5
+EXTRACTION_MODEL=google/gemini-2.5-flash-lite
 
 # Storage — DB_PATH must be writable by the alfred macOS user
 DB_PATH=/Users/alfred/alfred.db
@@ -92,6 +96,7 @@ IMESSAGE_DB_PATH=/Users/alfred/Library/Messages/chat.db
 
 # Optional
 TODOIST_API_TOKEN=...                 # from todoist.com/app/settings/integrations/developer
+FIRECRAWL_API_KEY=...                 # from firecrawl.dev — enables web search + scraping
 
 # Behaviour
 QUIET_HOURS_START=23                  # Alfred stops proactive messages at 11pm
@@ -99,14 +104,24 @@ QUIET_HOURS_END=8                     # Alfred starts again at 8am
 USER_TIMEZONE=America/Chicago
 ```
 
-**Using Gemini Flash instead of OpenAI** (cheaper — get a free key at [aistudio.google.com](https://aistudio.google.com)):
+### OpenRouter setup (recommended)
+
+OpenRouter gives you access to Claude, Gemini, and GPT-4 models under one key with no per-model key management.
+
+1. Sign up at [openrouter.ai](https://openrouter.ai)
+2. Create an API key
+3. Set `OPENAI_API_KEY=<your openrouter key>` and `LLM_BASE_URL=https://openrouter.ai/api/v1`
+
+### Using OpenAI directly
+
 ```bash
-LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-OPENAI_API_KEY=<Gemini API key>
-LLM_MODEL=gemini-2.0-flash
-EXTRACTION_MODEL=gemini-2.0-flash
+OPENAI_API_KEY=sk-...
+# leave LLM_BASE_URL unset (or delete it)
+LLM_MODEL=gpt-4o-mini
+EXTRACTION_MODEL=gpt-4o-mini
 ```
-Note: audio transcription and image vision are still hardcoded to OpenAI — you'll need an OpenAI key for those features even if using Gemini for chat.
+
+Note: the classifier and ack generator are hardcoded to `google/gemini-2.5-flash-lite` via OpenRouter regardless of your `LLM_MODEL`. If you're not using OpenRouter, set `LLM_BASE_URL` to your provider's base URL and adjust model names accordingly.
 
 ---
 
@@ -120,29 +135,20 @@ Restart your terminal after granting access.
 
 ---
 
-## Step 7: Grant alfred user access to Messages database
-
-The Alfred process runs as the `alfred` macOS user and reads its own Messages database. You need to give the `alfred` user access to the project directory so it can write its own database file.
-
-The `DB_PATH=/Users/alfred/alfred.db` in your `.env` handles this — Alfred writes its memory database to the alfred user's home, where it has full write access. No extra permissions needed.
-
----
-
-## Step 8: Run
+## Step 7: Run
 
 **Terminal 1** — start ChromaDB (the vector store):
 ```bash
-chroma run --path /Users/shivamgarg/dev/alfred/chroma_data
+chroma run --path /path/to/alfred/chroma_data
 ```
 
 **Terminal 2** — switch to the alfred macOS user and start Alfred:
 
-Either use fast user switching to open a terminal as the alfred user, or use `su`:
+Either use fast user switching to open a terminal as the alfred user, or:
 
 ```bash
 su - alfred
-cd /path/to/alfred   # wherever you cloned the repo
-/opt/homebrew/bin/node --import ./node_modules/tsx/dist/esm/index.cjs src/index.ts
+/opt/homebrew/bin/node --import /path/to/alfred/node_modules/tsx/dist/esm/index.cjs /path/to/alfred/src/index.ts
 ```
 
 You should see:
@@ -158,6 +164,27 @@ Text Alfred's Gmail from your iPhone. You should get a reply within ~5 seconds.
 
 ---
 
+## Useful commands
+
+```bash
+# Type-check without running
+pnpm typecheck
+
+# Visualize the memory graph (opens in browser)
+pnpm memory:viz -- --serve --open
+
+# Reset learned memory (keeps raw messages)
+pnpm memory:reset -- --yes
+
+# Full wipe including messages
+pnpm memory:reset -- --yes --include-messages
+
+# Recount descendant_count for all facts (run as alfred user)
+node --import ./node_modules/tsx/dist/esm/index.cjs scripts/recount-descendants.ts
+```
+
+---
+
 ## Troubleshooting
 
 **`Cannot open database because the directory does not exist`**
@@ -169,22 +196,41 @@ Text Alfred's Gmail from your iPhone. You should get a reply within ~5 seconds.
 - Fix: set `DB_PATH=/Users/alfred/alfred.db` (alfred's home directory)
 
 **Alfred receives messages but doesn't reply**
-- Wrap the handler in try-catch to see the actual error (already done in the code)
 - Check for `[alfred] handler error:` in the terminal
+- Check the classifier output — `silent` mode means Alfred intentionally didn't respond
+
+**Tool calls show raw XML in iMessage**
+- This means the XML tool-call fallback failed to parse the model's output
+- Check `[llm]` logs for `xml tool calls — synthetic` to confirm the fallback fired
+- If you see raw `<function_calls>` or `<tool_use>` in a sent message, file an issue with the model name and full log
 
 **Extractor not storing facts**
 - Check for `[extractor] Parse failed:` — the LLM returned wrong JSON
-- Facts only get stored for messages with real content — short/casual messages return `facts: []` which is correct
+- Facts only get stored for messages with real personal content — weather checks etc return `facts: []` which is correct
 
-**ChromaDB warnings about DefaultEmbeddingFunction**
-- Already fixed — we use `OpenAIEmbeddings` class directly. Make sure you're on the latest code.
+**ChromaDB not connecting**
+- Make sure `chroma run --path ./chroma_data` is running in a separate terminal
+- Alfred degrades gracefully — FTS5 carries retrieval, but semantic search and embedding won't work
 
 **Messages not appearing in alfred user's Messages app**
-- Switch to the alfred user and open Messages — it may need to be running for iMessage sync
+- Switch to the alfred user and open Messages — it needs to be running for iMessage sync
 - Verify Alfred's Apple ID is signed in: Messages → Settings → iMessage
+
+**Audio transcription failing**
+- Alfred uses `afconvert` (built into macOS) to convert CAF to WAV — no extra install needed
+- Check for `[transcription] error:` in the logs
 
 ---
 
 ## Keeping Alfred running
 
-For now, Alfred runs in a terminal tab. To keep it alive across Mac restarts or session disconnects, add it to `pm2` or create a `launchd` plist — documentation for this is in `docs/ops.md` (coming soon).
+For now, Alfred runs in a terminal tab. To keep it alive across Mac restarts, add it to `pm2`:
+
+```bash
+npm install -g pm2
+pm2 start /opt/homebrew/bin/node --name alfred -- \
+  --import /path/to/alfred/node_modules/tsx/dist/esm/index.cjs \
+  /path/to/alfred/src/index.ts
+pm2 save
+pm2 startup
+```

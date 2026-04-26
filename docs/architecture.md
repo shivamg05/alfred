@@ -27,44 +27,73 @@ Alfred's Apple ID (madsoccerfeet@gmail.com)
     ▼
 Message handler (src/index.ts onDirectMessage)
     │
-    ├─ audio? → ffmpeg → Whisper API → transcript
-    ├─ image? → GPT-4o Vision → description
-    ├─ file?  → pdf-parse/mammoth → Claude summary
+    ├─ audio? → afconvert (CAF→WAV) → Gemini Flash (base64 chat) → transcript
+    ├─ image? → heic-convert (HEIC→JPEG) → Claude haiku vision → description
+    ├─ file?  → pdf-parse / mammoth → summary
     └─ text?  → passthrough
     │
     ▼
 insertMessage() → SQLite messages table
     │
-    ▼ (parallel)
-    ├─ Build context window ──────────────────────────────┐
-    │    ├─ ConversationBuffer (last 20 msgs, in-memory)  │
-    │    ├─ SQLite: reminders + user_profile              │
-    │    ├─ ChromaDB: top 5 semantically similar facts    │
-    │    └─ Todoist API: open tasks (cached 30min)        │
-    │                                                     │
-    │  System prompt assembled ◄──────────────────────────┘
-    │         │
-    │         ▼
-    │    LLM call (gpt-4o-mini / gemini-flash / etc.)
-    │         │
-    │         ▼
-    │    Response split on [SPLIT]
-    │         │
-    │         ▼
-    │    sdk.send() bubbles with 800ms pacing
+    ▼ (fire-and-forget parallel)
+    ├─ Classifier (Gemini flash-lite, ~500ms) ──────────────────────────────┐
+    │                                                                        │
+    └─ 1-2s debounce (batches rapid-fire messages)                          │
+         │                                                                   │
+         ▼                                                                   │
+    Resolved mode ◄─────────────────────────────────────────────────────────┘
+         │
+         ├─ silent     → no response
+         ├─ acknowledge → Gemini generates contextual 1-4 word ack, send
+         └─ brief/full
+               │
+               ▼
+          fetchContext() — 3-tier memory assembly
+            ├─ ConversationBuffer (last 20 msgs, in-process)
+            ├─ Level-2 identity facts (SQLite, always-on)
+            ├─ Level-1 bedrock patterns (SQLite, ranked by descendant_count)
+            ├─ Hybrid retrieval: ChromaDB semantic + FTS5 BM25 → RRF merge
+            │    + graph expansion: instance_of parents + relates_to neighbors
+            └─ Todoist API (only for full mode + task-related queries)
+               │
+               ▼
+          buildPrompt() → system prompt with memory sections
+               │
+               ▼
+          chat() — multi-turn tool loop (max 8 iters)
+            model: Claude haiku-4.5 via OpenRouter
+            tools: search_web, scrape_url, todoist_list_tasks,
+                   todoist_create_task, todoist_close_task, todoist_update_task
+            XML tool-call fallback: detects <function_calls>/<tool_use> in
+            content text and executes them when structured tool_calls is empty
+               │
+               ▼
+          sendBubbles() — split on [SPLIT], 1500ms between bubbles
     │
-    └─ Background: extractFromMessage()
+    └─ Background: session buffer (batches 5 msgs or 2min idle)
            │
            ▼
-       LLM extracts: facts / reminders / todoist_tasks
-           │
+       extractFromMessage() — LLM extracts atomic facts + reminders
            ├─ facts → insertFact() → SQLite
-           │       → ChromaDB upsert (OpenAI embedding)
-           │       → graph wiring: updates/extends/instance_of/relates_to
-           │       → upsertProfileFact() → user_profile
-           ├─ reminders → insertReminder() → SQLite
-           └─ todoist_tasks → Todoist REST API
+           │       → ChromaDB upsert (text-embedding-3-small)
+           │       → graph wiring: instance_of / relates_to / updates / extends
+           │       → upsertProfileFact() → user_profile (level 1+2 only)
+           └─ reminders → insertReminder() → SQLite
+                         (fires via per-minute cron, independent of messages)
 ```
+
+---
+
+## Response modes
+
+| Mode | Trigger | Behavior |
+|---|---|---|
+| `silent` | Pure reaction ("lol", "fr", "💀") | No response sent |
+| `acknowledge` | Explicit command or receipt-only ("noted", "just fyi") | Gemini generates contextual 1-4 word ack |
+| `brief` | Sharing, venting, life update, emotional message | 1 sentence ≤15 words, no tools |
+| `full` | Explicit question, request, or task | Up to 2 bubbles, tools enabled |
+
+The classifier (Gemini flash-lite) fires immediately when a message arrives, in parallel with retrieval. 5s timeout — defaults to `brief` on failure.
 
 ---
 
@@ -72,118 +101,110 @@ insertMessage() → SQLite messages table
 
 ### Why not just use embeddings?
 
-Naive embedding similarity ("find the 5 most similar past messages") fails for a journal because:
+Naive embedding similarity fails for a journal because:
 - Short casual messages embed similarly even when unrelated
-- You lose structured information (is this a fact, a reminder, a mood?)
-- No version tracking — if you say "stopped going to the gym" you still retrieve "goes to the gym"
+- You lose structured information (fact vs. mood vs. plan)
+- No version tracking — "stopped going to the gym" still retrieves "goes to the gym"
 
-Alfred uses **atomic fact extraction** inspired by [supermemory.ai](https://supermemory.ai/research/):
+Alfred uses **atomic fact extraction** into a knowledge graph:
 - Each message is decomposed into discrete, self-contained facts
 - Facts are embedded individually (not the raw message)
-- Facts can be versioned and superseded via `fact_relations`
-- Facts are organized into levels: specific event/state (`0`), pattern (`1`), identity/value (`2`)
-- Expired level-0 facts can consolidate into higher-level patterns rather than simply disappear
+- Facts are versioned via directed graph edges (`updates`, `extends`)
+- Facts are organized into abstraction levels and linked via `instance_of` hierarchy
+- `descendant_count` tracks subtree size for importance ranking
 
 ### Three tiers
 
 **Tier 1: ConversationBuffer**
-- In-process JavaScript array, last 20 messages
-- Zero latency — no DB round trip
+- In-process array, last 20 messages, zero latency
 - Resets after 4 hours of silence (new session)
+- Seeded from DB on startup
 
-**Tier 2: Working memory (SQLite)**
-- `user_profile` — static facts (always injected) + dynamic facts (injected when relevant)
-- `reminders` — unfired reminders due within the next hour
-- Queried synchronously via `better-sqlite3`
+**Tier 2: Working memory (SQLite, always-on)**
+- Level-2 identity facts — always injected as `CORE IDENTITY`
+- Level-1 bedrock patterns — always injected as `FOUNDATIONAL PATTERNS`, ranked by `descendant_count / (1 + age_days × 0.05)`
 
-**Tier 3: Long-term semantic memory (SQLite graph + ChromaDB)**
+**Tier 3: Long-term semantic memory (ChromaDB + FTS5)**
 - Every extracted fact, embedded with `text-embedding-3-small`
-- Query-specific retrieval uses ChromaDB semantic search + SQLite FTS5 merged with RRF
-- Always-on context includes level-2 identity anchors and level-1 bedrock patterns
-- Retrieved details expand upward through `instance_of` parents, then laterally via `relates_to`
+- Query-specific retrieval via `RELEVANT MEMORY` section
+- ChromaDB semantic search + SQLite FTS5 BM25 merged via RRF
+- Recency half-life: 30 days. Upcoming events get a boost.
+- Graph expansion: upward via `instance_of` (2 hops), then lateral via `relates_to`
 
-See [memory.md](./memory.md) for the detailed memory graph architecture.
-
-### Fact schema
-
-```
-memory_facts
-  id                   INTEGER PK
-  text                 TEXT     — self-contained, third-person ("User is building...")
-  abstraction_level    INTEGER  — 0=event/state, 1=pattern, 2=identity/value
-  descendant_count     INTEGER  — cached subtree support count
-  root_fact_id         INTEGER  — original fact in a contradiction chain
-  parent_fact_id       INTEGER  — the fact this one supersedes
-  is_latest            BOOL     — false when a newer fact supersedes this
-  is_static            BOOL     — true for stable long-term facts
-  document_date        TEXT     — when the message was sent
-  event_date           TEXT     — when the described event occurs (nullable)
-  forget_after         TEXT     — auto-expire date for temporary facts
-  source_message_id    INTEGER  — FK to messages
-  chroma_id            TEXT     — corresponding ChromaDB document ID
-```
-
-### Contradiction detection
-
-When the extractor LLM detects that a new fact supersedes or refines an old one, it includes a `contradicts_hint` or `extends_hint` in its output. The resolver:
-
-1. Searches existing facts for the hinted old fact
-2. Writes an `updates` or `extends` relation from the new fact to the old fact
-3. Marks the old fact `is_latest = false`
-4. Rewires children only for `extends`; `updates` keeps old children attached as historical evidence
-
-Result: "User moved to Austin" supersedes "User lives in NYC" rather than coexisting.
+See [memory.md](./memory.md) for the full knowledge graph architecture.
 
 ---
 
 ## Proactive engine
 
-Three scheduled jobs + one reactive trigger:
-
 | Trigger | Schedule | What |
 |---|---|---|
-| Morning brief | 9:00am | Open reminders + dynamic profile + today's Todoist tasks |
-| Midday pulse | 1:00pm | Surface one connection from long-term memory |
-| Evening wrap | 7:00pm | Check overdue items + inactivity check |
-| On-message hook | After every message | Fire any reminder due within 60 minutes |
+| Reminder cron | Every minute | Fires any reminders past their `due_at` |
+| Morning brief | 9:00am | Today's Todoist tasks + upcoming events from memory |
+| Midday pulse | 1:00pm | Heads up if something happening in next 48h |
+| Evening wrap | 7:00pm | Check open/overdue Todoist tasks |
+| L0 consolidation | Every 6h | Expire L0 facts, cluster into L1 patterns |
+| L1→L2 promotion | Weekly (Sunday 3:30am) | Promote supported patterns to identity/values |
 
 **Gate checks before every proactive send:**
-1. Is it within quiet hours? (`QUIET_HOURS_END` to `QUIET_HOURS_START`) → skip
-2. Was a proactive message sent in the last 3 hours? → skip
-3. Is the generated message non-empty? → skip if not
+1. Within quiet hours? → skip
+2. Proactive message sent in last 3 hours? → skip (spam prevention)
+3. LLM returns `SKIP`? → skip
+
+Proactive messages have tools enabled — the morning brief and evening wrap use `todoist_list_tasks` to get real data, not cached context.
+
+---
+
+## Extraction
+
+Messages are buffered (up to 5, or 2 min idle) then sent to an LLM extraction call. The extractor:
+
+- Injects existing profile + FTS-matched topical facts so the model skips near-duplicates
+- Pre-insertion guard: skips facts with ChromaDB distance < 0.18 to an existing fact
+- Assigns `abstraction_level` (0/1/2) and computes `forget_after` for L0 only
+- Auto-wires `instance_of` parent edges (via hints + semantic parent search)
+- Auto-wires same-level `relates_to` edges for new facts with distance 0.12–0.55
+- Handles `contradicts_hint` → `updates` edge + mark old `is_latest=0`
+- Handles `extends_hint` → `extends` edge + rewire children to new fact
+
+**Reminders** — created only on explicit user requests ("remind me to...", "don't let me forget"). Time-bound statements of intent ("I need to X in 2 hours") also qualify. Vague intent without a timeframe does not.
+
+**Todoist tasks** — never created by the extractor. Only created when the user explicitly asks Alfred during a conversation via the `todoist_create_task` tool.
+
+---
+
+## Tool calls
+
+Alfred uses structured API `tool_calls` when the model supports them. Claude models via OpenRouter sometimes output tool calls as embedded XML text (`<function_calls>` or `<tool_use>` format) instead. The `chat()` loop in `orchestrator/llm.ts` detects both formats, executes them, and continues the loop — the user never sees raw XML.
 
 ---
 
 ## iMessage account setup
 
-Apple does not provide a public iMessage API. Alfred uses [imessage-kit](https://github.com/photon-hq/imessage-kit) which:
+Apple provides no public iMessage API. Alfred uses [imessage-kit](https://github.com/photon-hq/imessage-kit) which:
 - Watches `~/Library/Messages/chat.db` via SQLite WAL events
 - Sends messages via AppleScript (`osascript`)
 
-**Why a separate macOS user:**
-macOS Messages supports only one Apple ID at a time. Alfred needs its own Apple ID to have a distinct iMessage address. A second macOS user account gives Alfred an isolated Messages session without interfering with the main user's iMessages.
+**Why a separate macOS user:** macOS Messages supports only one Apple ID at a time. Alfred needs its own Apple ID to have a distinct iMessage address. A second macOS user account gives Alfred an isolated Messages session.
 
-**Why not text yourself:**
-Messages sent from your own Apple ID are marked `isFromMe = true` in the database — the watcher's `onDirectMessage` callback would never fire.
+**Why not text yourself:** Messages sent from your own Apple ID are marked `isFromMe = true` — the watcher's `onDirectMessage` callback would never fire.
 
 ---
 
-## LLM provider
+## LLM calls
 
-Alfred uses the OpenAI SDK but supports any OpenAI-compatible endpoint via `LLM_BASE_URL`:
+All LLM calls go through the OpenAI SDK pointed at `LLM_BASE_URL` (currently OpenRouter).
 
-| Provider | Config |
-|---|---|
-| OpenAI (default) | No `LLM_BASE_URL` needed |
-| Gemini Flash | `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai` |
-| Groq | `LLM_BASE_URL=https://api.groq.com/openai/v1` |
-
-**Which calls use which model:**
-- `LLM_MODEL` → Alfred's responses, proactive messages
-- `EXTRACTION_MODEL` → background fact/reminder extraction (can be cheaper)
-- `whisper-1` → audio transcription (hardcoded OpenAI, no compat layer)
-- `gpt-4o` → image vision (hardcoded OpenAI)
-- `text-embedding-3-small` → fact embeddings (hardcoded OpenAI)
+| Call | Model | Notes |
+|---|---|---|
+| Alfred's responses | `LLM_MODEL` (claude haiku-4.5) | Multi-turn tool loop, max 200 tokens |
+| Classifier | `google/gemini-2.5-flash-lite` | 5s timeout, hardcoded |
+| Contextual acks | `google/gemini-2.5-flash-lite` | 1-4 words, max 20 tokens |
+| Extraction | `EXTRACTION_MODEL` | Max 1500 tokens, JSON mode |
+| Proactive | `LLM_MODEL` | Max 150 tokens, tools enabled |
+| Transcription | `google/gemini-2.5-flash-lite` | Base64 WAV via `input_audio` |
+| Image vision | `anthropic/claude-haiku-4-5` | Via OpenRouter |
+| Embeddings | `openai/text-embedding-3-small` | Via LLM_BASE_URL |
 
 ---
 
@@ -193,8 +214,8 @@ The main constraint for scaling is **iMessage requires a Mac**. Apple has no clo
 
 **Options:**
 1. **MacStadium / AWS EC2 Mac** — cloud Mac, Alfred runs there, iMessage signed in. ~$99/month per Mac.
-2. **Phone number relay** — each user gets a Twilio number registered to a Mac Apple ID. Relay server routes messages to the right Alfred instance. This is how Beeper/Texts.app work.
-3. **Drop iMessage** — Phase 2 uses WhatsApp Business API or Telegram Bot API (real cloud APIs). iMessage stays as a power-user option.
+2. **Phone number relay** — each user gets a Twilio number registered to a Mac Apple ID. Relay server routes messages to the right Alfred instance.
+3. **Drop iMessage** — Phase 2 uses WhatsApp Business API or Telegram Bot API. iMessage stays as a power-user option.
 
 **Database migration path:**
 - SQLite → PostgreSQL + pgvector (replaces ChromaDB entirely)

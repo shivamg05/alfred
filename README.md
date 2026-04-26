@@ -8,26 +8,26 @@ An AI journal and second brain that lives natively in iMessage. Text it notes, v
 
 **Capture anything**
 - Text notes → stored and remembered
-- Voice memos → transcribed via Whisper, then stored
-- Images → described via GPT-4o Vision, then stored
+- Voice memos → transcribed via Gemini Flash, then stored
+- Images → described via Claude vision, then stored
 - Files (PDF, DOCX, txt) → summarized, then stored
 
 **Memory that compounds**
 - Every message is decomposed into atomic facts and embedded
-- Facts are organized into three abstraction levels: events/state, patterns, identity/values
-- Temporary level-0 facts expire and consolidate into durable patterns when repeated
-- Contradictions and refinements preserve history through directed graph edges
+- Facts are organized into three abstraction levels: events/state (`0`), patterns (`1`), identity/values (`2`)
+- Level-0 facts expire and consolidate into durable patterns when repeated
+- Contradictions and refinements preserve history through a directed knowledge graph
 - Hybrid retrieval: identity anchors + structural bedrock + semantic/keyword detail + graph expansion
 
 **Proactive (not just reactive)**
-- 9am morning brief: what's on your plate today
-- 1pm: surfaces a connection from your past
-- 7pm: wraps up the day, checks in if you've gone quiet
-- Fires reminders inline when they come due
+- 9am morning brief: today's tasks + upcoming events
+- 1pm: surfaces a heads up if something is happening in the next 48h
+- 7pm: checks what's still open on Todoist
+- Per-minute cron fires reminders exactly when they come due
 
 **Todoist integration**
-- Alfred sees your open tasks and references them naturally
-- Detects actionable intent in messages and auto-creates tasks ("i gotta email Jake back" → creates task)
+- Alfred sees your open tasks and references them naturally in conversation
+- Creates tasks only when you explicitly ask ("add X to my todoist")
 
 **Tone**
 Casual, lowercase, Gen Z. Feels like texting a friend, not querying a database.
@@ -37,150 +37,112 @@ Casual, lowercase, Gen Z. Feels like texting a friend, not querying a database.
 ## Architecture
 
 ```
-User texts madsoccerfeet@gmail.com (Alfred's Apple ID)
+User texts Alfred's Apple ID
         ↓
 imessage-kit WAL watcher (onDirectMessage)
         ↓
-Message router — text / audio / image / file
-  audio → ffmpeg → Whisper API → transcript
-  image → GPT-4o Vision → description
+Attachment handler — audio / image / file / text
+  audio → afconvert (CAF→WAV) → Gemini Flash → transcript
+  image → heic-convert → Claude vision → description
   file  → pdf-parse / mammoth → summary
         ↓
-LLM call (context window assembled from 3 memory tiers)
+insertMessage() → SQLite
+        ↓ (parallel)
+  ├─ Classifier (Gemini flash-lite) → silent | acknowledge | brief | full
+  └─ 1-2s debounce window (batches rapid-fire messages)
         ↓
-Response → split on [SPLIT] → send each bubble with 800ms pacing
+  ├─ silent    → no response
+  ├─ acknowledge → Gemini generates contextual 1-4 word ack
+  └─ brief/full → context assembled from 3 memory tiers
+                      ↓
+                 LLM response loop (Claude haiku-4.5 via OpenRouter)
+                 max 8 tool-call iterations
+                 tools: search_web, scrape_url, todoist_*
+                      ↓
+                 Response → split on [SPLIT] → send bubbles (1500ms pacing)
         ↓
-Background: extract facts + reminders + Todoist tasks from message
+Background: session buffer (5 msgs or 2min idle) → extractFromMessage()
+  → facts → SQLite + ChromaDB + graph wiring
+  → reminders → SQLite (fires via per-minute cron)
 ```
 
 ### Memory tiers
 
 | Tier | What | Where |
 |---|---|---|
-| Short-term | Last 20 messages | In-process `ConversationBuffer` |
-| Working | Active reminders + user profile | SQLite |
-| Long-term | Every extracted fact, embedded | ChromaDB (local) |
+| Short-term | Last 20 messages, resets after 4h silence | In-process `ConversationBuffer` |
+| Working | Level-2 identity + Level-1 bedrock patterns (always-on) | SQLite |
+| Long-term | All extracted facts, query-specific retrieval | ChromaDB + SQLite FTS5 |
 
 ### Retrieval layers
 
-1. Core identity: latest level-2 facts, always injected once
-2. Foundational patterns: level-1 facts ranked by descendant count
-3. Relevant detail: ChromaDB semantic search + SQLite FTS5 merged with RRF
-4. Upward graph expansion: retrieved details pull in `instance_of` parents
-5. Lateral graph expansion: small same-level `relates_to` budget
+1. **Core identity**: latest level-2 facts, always injected
+2. **Foundational patterns**: level-1 facts ranked by `descendant_count` (subtree support), always injected
+3. **Relevant detail**: ChromaDB semantic + SQLite FTS5 merged via RRF, with recency and upcoming-event boosts
+4. **Upward graph expansion**: retrieved facts pull in `instance_of` ancestors up to 2 hops
+5. **Lateral graph expansion**: small `relates_to` budget for same-level associations
 
 ### Folder structure
 
 ```
 src/
-  index.ts                    ← entry point
+  index.ts                    ← entry point, message handler, debounce
   config.ts                   ← zod-validated env vars
-  db/schema.ts                ← SQLite schema (7 tables)
+  db/schema.ts                ← SQLite schema + FTS5 virtual table
   ingestion/
-    router.ts                 ← classifies message type
-    transcription.ts          ← ffmpeg + Whisper
+    router.ts                 ← message type classification
+    transcription.ts          ← CAF→WAV + Gemini Flash transcription
     fileParser.ts             ← PDF/DOCX/image → summary
+    attachments.ts            ← WAL-race fallback for attachment lookup
   memory/
     shortTerm.ts              ← ConversationBuffer
-    facts.ts                  ← SQLite CRUD
+    facts.ts                  ← all SQLite reads/writes
     vectors.ts                ← ChromaDB client (OpenAI embeddings)
-    extractor.ts              ← background LLM extraction
-    consolidation.ts          ← expiry + pattern/identity promotion
-    resolver.ts               ← contradiction detection
-    retrieval.ts              ← hybrid retrieval + re-ranking
+    extractor.ts              ← session-based LLM fact extraction
+    consolidation.ts          ← expiry + L0→L1 and L1→L2 promotion
+    retrieval.ts              ← hybrid retrieval + RRF + graph expansion
   orchestrator/
-    context.ts                ← assembles context window
-    llm.ts                    ← OpenAI-compatible chat calls
-    response.ts               ← multi-bubble send
+    classifier.ts             ← intent classifier + contextual ack generator
+    context.ts                ← context window assembly
+    llm.ts                    ← multi-turn tool loop, XML tool-call fallback
+    response.ts               ← multi-bubble send with pacing
   proactive/
-    engine.ts                 ← 3 daily cron jobs
+    engine.ts                 ← cron jobs (reminders, briefs, consolidation)
     gate.ts                   ← quiet hours + spam prevention
   tone/
     systemPrompt.ts           ← Alfred's personality + context injection
   integrations/
-    todoist.ts                ← read tasks, create tasks
+    todoist.ts                ← list/create/close/update tasks
+  tools/
+    registry.ts               ← tool definitions + dispatcher
+    web.ts                    ← Firecrawl search + scrape
+    todoist.ts                ← tool dispatch layer
 ```
 
 ---
 
 ## Setup
 
-### Prerequisites
+See [docs/setup.md](docs/setup.md) for the full setup guide.
 
-- macOS (required — iMessage is Mac-only)
-- Node.js 20+
-- pnpm (`npm install -g pnpm`)
-- Python 3 + pipx (`brew install pipx`)
-- ffmpeg (`brew install ffmpeg`) — for audio transcription
-- ChromaDB (`pipx install chromadb`)
-- An OpenAI API key (or compatible provider)
-
-### iMessage account setup
-
-Alfred needs its own Apple ID so it has a distinct iMessage address to receive messages.
-
-1. Create a new Apple ID at [appleid.apple.com](https://appleid.apple.com) using a spare Gmail address (not an `@icloud.com` address — Apple won't let you create those directly)
-2. On your Mac, create a **separate macOS user account** (System Settings → Users & Groups → Add Account) — call it "alfred"
-3. Log into the alfred macOS user, open Messages, and sign in with the new Apple ID
-4. Send a test iMessage from your iPhone to that Gmail address — it should appear in Alfred's Messages on Mac
-5. Switch back to your main user account — Alfred's Messages session stays active in the background
-
-> **Why a separate macOS user?** macOS Messages only supports one Apple ID at a time. A second user account gives Alfred its own isolated Messages session without affecting yours.
-
-### Installation
+### Quick start
 
 ```bash
-# Clone
 git clone https://github.com/shivamg05/alfred.git
 cd alfred
-
-# Install dependencies
 pnpm install
-
-# Build better-sqlite3 native module (required once)
-cd node_modules/better-sqlite3 && node-gyp configure build && cd ../..
-
-# Copy and fill in env
 cp .env.example .env
+# edit .env — see docs/setup.md
 ```
 
-Edit `.env`:
-```
-ALFRED_PHONE=yourbot@gmail.com        # the Apple ID Alfred listens on
-USER_PHONE=+1xxxxxxxxxx               # your phone number
-OPENAI_API_KEY=sk-...
-DB_PATH=/Users/alfred/alfred.db       # writable by the alfred macOS user
-IMESSAGE_DB_PATH=/Users/alfred/Library/Messages/chat.db
-TODOIST_API_TOKEN=...                 # optional
-```
-
-### Grant permissions
-
-In System Settings → Privacy & Security → Full Disk Access → enable **Terminal** (or whatever terminal app you use).
-
-### Run
-
-In one terminal tab, start ChromaDB:
+Start ChromaDB:
 ```bash
 chroma run --path ./chroma_data
 ```
 
-In another tab, **switch to the alfred macOS user** (fast user switching or open a terminal session as alfred), then:
+Start Alfred (as the `alfred` macOS user):
 ```bash
-/opt/homebrew/bin/node --import /path/to/alfred/node_modules/tsx/dist/esm/index.cjs /path/to/alfred/src/index.ts
-```
-
-Alfred starts watching. Text its Apple ID from your iPhone.
-
-### Using a cheaper LLM provider
-
-Alfred uses an OpenAI-compatible interface. To use Gemini Flash (~10x cheaper):
-
-```env
-LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-OPENAI_API_KEY=<your Gemini API key>
-LLM_MODEL=gemini-2.0-flash
-EXTRACTION_MODEL=gemini-2.0-flash
+/opt/homebrew/bin/node --import ./node_modules/tsx/dist/esm/index.cjs src/index.ts
 ```
 
 ---
@@ -188,20 +150,20 @@ EXTRACTION_MODEL=gemini-2.0-flash
 ## Database schema
 
 ```sql
-messages          -- raw messages + transcripts/summaries
-memory_facts      -- atomic facts extracted from messages
-                  -- abstraction_level, descendant_count, is_latest, is_forgotten
-fact_relations    -- typed relations: instance_of | relates_to | updates | extends | derives | consolidated_from
-reminders         -- due_at reminders, fired_at tracking
-user_profile      -- materialized static + dynamic facts about the user
-proactive_log     -- log of every proactive message sent
+messages            -- raw messages + transcripts/summaries
+memory_facts        -- atomic facts; abstraction_level, descendant_count, is_latest, forget_after
+memory_facts_fts    -- FTS5 virtual table (auto-synced via triggers)
+fact_relations      -- instance_of | relates_to | updates | extends | derives | consolidated_from
+reminders           -- due_at reminders, fired_at tracking
+user_profile        -- materialized level-1/2 facts for fast profile reads
+proactive_log       -- every proactive message sent and when
 ```
 
 ---
 
 ## Scaling (Phase 2 notes)
 
-Phase 1 runs entirely on your Mac. When ready to scale:
+Phase 1 runs entirely on your Mac. The main constraint for scaling is **iMessage requires a Mac** — Apple has no cloud API.
 
 | Component | Phase 1 | Phase 2 |
 |---|---|---|
