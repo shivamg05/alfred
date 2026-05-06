@@ -179,6 +179,68 @@ describe("classifyWithTimeout", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────
+// classifyIntent — last-3-message cap
+// ────────────────────────────────────────────────────────────────────
+
+describe("classifyIntent last-3 message cap", () => {
+  it("only includes last 3 messages even when more are provided", async () => {
+    mockCreate.mockResolvedValue(fakeResponse('{"mode": "full"}'));
+
+    await classifyIntent("follow up", [
+      { role: "user", content: "msg-1-old" },
+      { role: "assistant", content: "msg-2-old" },
+      { role: "user", content: "msg-3-old" },
+      { role: "assistant", content: "msg-4-old" },
+      { role: "user", content: "msg-5-recent" },
+      { role: "assistant", content: "msg-6-recent" },
+      { role: "user", content: "msg-7-recent" },
+    ]);
+
+    const callArgs = mockCreate.mock.calls[0][0];
+    const systemContent: string = callArgs.messages[0].content;
+
+    // Should include last 3
+    expect(systemContent).toContain("msg-5-recent");
+    expect(systemContent).toContain("msg-6-recent");
+    expect(systemContent).toContain("msg-7-recent");
+
+    // Should NOT include older messages
+    expect(systemContent).not.toContain("msg-1-old");
+    expect(systemContent).not.toContain("msg-2-old");
+    expect(systemContent).not.toContain("msg-3-old");
+    expect(systemContent).not.toContain("msg-4-old");
+  });
+
+  it("works fine when fewer than 3 messages provided", async () => {
+    mockCreate.mockResolvedValue(fakeResponse('{"mode": "brief"}'));
+
+    await classifyIntent("test", [
+      { role: "user", content: "only-one" },
+    ]);
+
+    const callArgs = mockCreate.mock.calls[0][0];
+    const systemContent: string = callArgs.messages[0].content;
+    expect(systemContent).toContain("only-one");
+  });
+
+  it("includes exactly 3 messages when exactly 3 provided", async () => {
+    mockCreate.mockResolvedValue(fakeResponse('{"mode": "full"}'));
+
+    await classifyIntent("yes", [
+      { role: "assistant", content: "want to hear more?" },
+      { role: "user", content: "yes tell me" },
+      { role: "assistant", content: "ok so basically..." },
+    ]);
+
+    const callArgs = mockCreate.mock.calls[0][0];
+    const systemContent: string = callArgs.messages[0].content;
+    expect(systemContent).toContain("want to hear more?");
+    expect(systemContent).toContain("yes tell me");
+    expect(systemContent).toContain("ok so basically...");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
 // generateContextualAck — fallback and formatting
 // ────────────────────────────────────────────────────────────────────
 

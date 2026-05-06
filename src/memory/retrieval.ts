@@ -7,8 +7,10 @@ import {
   getInstanceOfParents,
   getRelatedFactIds,
   searchFactsFTS,
+  type MemoryFact,
 } from "./facts.js";
 import { querySimilarFacts } from "./vectors.js";
+import { config } from "../config.js";
 
 export interface RetrievedContext {
   /** Level 2 identity/value facts — always in every context window */
@@ -50,6 +52,83 @@ function formatWithSourceChunk(factText: string, sourceMessageId?: number): stri
   } catch {
     return factText;
   }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Timeline annotations — tell the model whether a fact is past/present/future
+// ────────────────────────────────────────────────────────────────────────────
+
+function userTodayStr(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: config().USER_TIMEZONE });
+}
+
+/**
+ * Produce a human-readable relative-time tag for a date string.
+ * Returns null if no useful annotation can be made.
+ */
+export function relativeTimeTag(dateStr: string, referenceLabel: "event" | "mentioned"): string | null {
+  if (!dateStr) return null;
+  const tz = config().USER_TIMEZONE;
+  const todayStr = userTodayStr(); // YYYY-MM-DD in user tz
+
+  // Normalize the target date to YYYY-MM-DD in user timezone
+  const targetDate = new Date(dateStr);
+  if (isNaN(targetDate.getTime())) return null;
+  const targetStr = targetDate.toLocaleDateString("en-CA", { timeZone: tz });
+
+  // Day difference (positive = future, negative = past)
+  const todayMs = new Date(todayStr).getTime();
+  const targetMs = new Date(targetStr).getTime();
+  const diffDays = Math.round((targetMs - todayMs) / (1000 * 60 * 60 * 24));
+
+  if (referenceLabel === "event") {
+    if (diffDays === 0) return "today";
+    if (diffDays === 1) return "tomorrow";
+    if (diffDays === -1) return "yesterday";
+    if (diffDays > 1 && diffDays <= 7) return `in ${diffDays} days`;
+    if (diffDays > 7 && diffDays <= 14) return "next week";
+    if (diffDays > 14 && diffDays <= 30) return `in ~${Math.round(diffDays / 7)} weeks`;
+    if (diffDays < -1 && diffDays >= -7) return `${Math.abs(diffDays)} days ago`;
+    if (diffDays < -7 && diffDays >= -14) return "last week";
+    if (diffDays < -14 && diffDays >= -60) return `${Math.round(Math.abs(diffDays) / 7)} weeks ago`;
+    if (diffDays < -60) return `${Math.round(Math.abs(diffDays) / 30)} months ago`;
+    if (diffDays > 30) return `in ~${Math.round(diffDays / 30)} months`;
+  }
+
+  if (referenceLabel === "mentioned") {
+    // Only annotate staleness for old facts — recent ones don't need it
+    if (diffDays === 0) return null; // today — no annotation needed
+    if (diffDays === -1) return null; // yesterday — still fresh
+    if (diffDays >= -7) return null; // within a week — still fresh
+    if (diffDays >= -30) return `mentioned ${Math.round(Math.abs(diffDays) / 7)}w ago`;
+    if (diffDays >= -90) return `mentioned ~${Math.round(Math.abs(diffDays) / 30)}mo ago`;
+    return `mentioned ${Math.round(Math.abs(diffDays) / 30)}mo ago — may be stale`;
+  }
+
+  return null;
+}
+
+/**
+ * Annotate a fact with a timeline tag if useful.
+ * - Facts with event_date: annotate relative to now ("tomorrow", "3 days ago")
+ * - L0 facts without event_date: annotate document_date staleness for old facts
+ * - L1/L2 facts: no annotation (timeless patterns/identity)
+ */
+export function formatWithTimeline(fact: MemoryFact): string {
+  // Try event_date first — most useful signal
+  if (fact.event_date) {
+    const tag = relativeTimeTag(fact.event_date, "event");
+    if (tag) return `${fact.text} [${tag}]`;
+  }
+
+  // For L0 (specific events/states), annotate staleness via document_date
+  if (fact.abstraction_level === 0 && fact.document_date) {
+    const tag = relativeTimeTag(fact.document_date, "mentioned");
+    if (tag) return `${fact.text} [${tag}]`;
+  }
+
+  // L1/L2 or recent L0 — no annotation needed
+  return fact.text;
 }
 
 export async function retrieveContext(queryText: string): Promise<RetrievedContext> {
@@ -125,7 +204,7 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
         const parent = getFactById(item.id);
         if (!parent || !parent.is_latest || parent.is_forgotten || seenText.has(parent.text)) continue;
         console.log(`[retrieval] upward expand: fact_${fact.id} -> fact_${parent.id} "${parent.text.slice(0, 60)}"`);
-        expansionLines.push(parent.text);
+        expansionLines.push(formatWithTimeline(parent));
         retrievedIds.add(parent.id);
         seenText.add(parent.text);
         for (const grandparentId of getInstanceOfParents(parent.id)) {
@@ -144,7 +223,7 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
         const f = getFactById(relId);
         if (!f || !f.is_latest || f.is_forgotten || alwaysTextSet.has(f.text) || seenText.has(f.text)) continue;
         console.log(`[retrieval] graph expand: fact_${fact.id} → fact_${relId} "${f.text.slice(0, 60)}"`);
-        expansionLines.push(f.text);
+        expansionLines.push(formatWithTimeline(f));
         retrievedIds.add(relId);
         seenText.add(f.text);
       }
@@ -153,7 +232,7 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
     retrieved = [
       ...top10.map(({ fact }) => {
         seenText.add(fact.text);
-        return fact.text;
+        return formatWithTimeline(fact);
       }),
       ...expansionLines,
     ];
@@ -162,7 +241,7 @@ export async function retrieveContext(queryText: string): Promise<RetrievedConte
     retrieved = getActiveDynamicFacts()
       .filter((f) => !alwaysTextSet.has(f.text))
       .slice(0, 12)
-      .map((f) => f.text);
+      .map((f) => formatWithTimeline(f));
   }
 
   const tDone = Date.now();
