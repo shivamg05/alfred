@@ -92,9 +92,11 @@ export async function classifyIntent(
 ): Promise<ResponseMode> {
   const t0 = Date.now();
 
-  // Build context string from recent conversation so classifier understands follow-ups
-  const contextBlock = recentMessages.length > 0
-    ? `\nRECENT CONVERSATION (for context only):\n${recentMessages.map((m) => `[${m.role === "assistant" ? "alfred" : "user"}]: ${m.content}`).join("\n")}\n`
+  // Only feed last 3 messages — enough for follow-up detection without
+  // bloating the cheap/fast classifier with irrelevant history.
+  const tail = recentMessages.slice(-3);
+  const contextBlock = tail.length > 0
+    ? `\nRECENT CONVERSATION (for context only):\n${tail.map((m) => `[${m.role === "assistant" ? "alfred" : "user"}]: ${m.content}`).join("\n")}\n`
     : "";
 
   try {
