@@ -15,6 +15,7 @@ import {
   getBedrockFacts,
   getFactById,
   searchFactsFTS,
+  setProactiveAfter,
 } from "./facts.js";
 import { upsertFact as chromaUpsert, querySimilarFacts } from "./vectors.js";
 
@@ -34,6 +35,7 @@ const factSchema = z
     contradicts_hint: z.string().optional(),
     extends_hint: z.string().optional(),
     parent_hint: z.string().optional(),
+    proactive_nudge: z.object({ after_hours: z.number() }).optional().nullable(),
   })
   .transform((d) => ({
     text: (d.text ?? d.fact ?? "").trim(),
@@ -44,6 +46,7 @@ const factSchema = z
     contradicts_hint: d.contradicts_hint,
     extends_hint: d.extends_hint,
     parent_hint: d.parent_hint,
+    proactive_nudge: d.proactive_nudge ?? null,
   }))
   .refine((d) => d.text.length > 0, { message: "fact must have non-empty text" });
 
@@ -74,6 +77,7 @@ const extractionSchema = z
                 contradicts_hint: undefined,
                 extends_hint: undefined,
                 parent_hint: undefined,
+                proactive_nudge: null,
               }
             : null;
         }
@@ -121,7 +125,7 @@ function llm(): OpenAI {
 // System prompt — aggressive, 5-category extraction
 // ---------------------------------------------------------------------------
 
-function buildExtractionPrompt(documentDate: string, existingFacts: string[]): string {
+function buildExtractionPrompt(documentDate: string, existingFacts: string[], userTimezone: string): string {
   const existingSection = existingFacts.length > 0
     ? `\nWHAT YOU ALREADY KNOW (do NOT re-extract these unless they changed):\n${existingFacts.map(f => `- ${f}`).join("\n")}\n`
     : "";
@@ -131,6 +135,7 @@ function buildExtractionPrompt(documentDate: string, existingFacts: string[]): s
 IMPORTANT: Extract useful memory aggressively, but keep facts atomic and typed. If a message contains genuinely NEW information, extract it. Skip anything already captured in "What you already know" unless it changed or adds detail.
 ${existingSection}
 Today's datetime: ${documentDate}
+User's timezone: ${userTimezone}
 
 Return a JSON object — all fields required (use empty arrays if nothing applies):
 {
@@ -148,7 +153,8 @@ FACTS — each fact MUST be a JSON object, not a string:
     "forget_after": "ISO datetime, ONLY for level 0",
     "contradicts_hint": "old fact phrase if this corrects/replaces it",
     "extends_hint": "old fact phrase if this refines/adds detail without contradiction",
-    "parent_hint": "existing higher-level fact this is an instance of"
+    "parent_hint": "existing higher-level fact this is an instance of",
+    "proactive_nudge": {"after_hours": N} or null
   }
 
 ABSTRACTION LEVELS:
@@ -187,15 +193,28 @@ EXTRACTION RULES:
 - Lean toward extraction. A slightly redundant fact is fine. A missed fact is bad.
 - DO NOT extract meta/conversational noise: "User is discussing X", "User is asking about Y", "User joked that..." — only extract facts about their actual life, opinions, plans, or identity.
 
+STANDING INSTRUCTIONS — ongoing behavioral commitments the user asks Alfred to follow:
+Triggers: "call me out when...", "hold me accountable to...", "don't let me...", "always remind me that...", "push back if I ever...", "check me on..."
+These are NOT one-time reminders. They are durable behavioral contracts between the user and Alfred.
+Extract these as LEVEL 1 facts (recurring behavioral pattern) with text like: "User wants Alfred to call them out when they reward themselves instead of grinding" or "User wants Alfred to push back when they skip the gym"
+Do NOT create reminders for these — they are standing instructions, not time-bound events.
+
+PROACTIVE_NUDGE — only for L0 facts representing unfulfilled intentions or active tensions:
+- Unfulfilled multi-day intentions (reach out to someone, apply somewhere, do an important task): after_hours=36
+- Same-day tensions or deadlines (stressed about something, procrastinating on something time-bound): after_hours=8
+- NOT for: completed actions, events with their own event_date, neutral observations, general plans with no urgency
+- Omit (null) for the vast majority of facts
+
 REMINDERS — explicit asks AND time-bound intent:
 Triggers: "remind me", "don't let me forget", "ping me", "i have to X in N minutes/hours", "i need to X in N minutes/hours", "i gotta X by [time]"
 NOT triggers: open-ended intent with no time ("i should call mom", "i need to study more") — only create a reminder if there's a clear timeframe
-due_at: ISO8601 datetime (use today's date + time context to compute)
+due_at: ISO8601 datetime WITH timezone offset (e.g. "2026-05-05T09:00:00-04:00" for 9am ET). CRITICAL: use the user's timezone (${userTimezone}) — "9am" means 9am in THEIR timezone, not UTC. Always include the timezone offset in the ISO8601 string.
 
 FOLLOW_UP_REMINDERS — deferred plans:
 Triggers: "wanna X later", "gonna X later", "planning to X", "meant to X"
 Alfred creates a check-in: "hey did you ever [X]?"
 due_at estimate: "later"=+4h, "tonight"=9pm today, "tomorrow"=next 9am, "this week"=+3days 9am
+CRITICAL: all due_at values MUST include the user's timezone offset (${userTimezone}). Never use bare UTC (Z suffix) for user-facing times.
 
 If truly nothing extractable: {"facts":[],"reminders":[],"todoist_tasks":[],"follow_up_reminders":[]}`;
 }
@@ -309,7 +328,7 @@ export async function extractFromMessage(opts: {
     const response = await llm().chat.completions.create({
       model: cfg.EXTRACTION_MODEL,
       messages: [
-        { role: "system", content: buildExtractionPrompt(opts.documentDate, existingFacts) },
+        { role: "system", content: buildExtractionPrompt(opts.documentDate, existingFacts, cfg.USER_TIMEZONE) },
         { role: "user", content: opts.messageText },
       ],
       max_tokens: 1500,
@@ -395,6 +414,13 @@ export async function extractFromMessage(opts: {
         forget_after: forgetAfter,
         source_message_id: opts.messageId || undefined,
       });
+
+      // Proactive nudge scheduling for L0 intentions and tensions
+      if (fact.abstraction_level === 0 && fact.proactive_nudge?.after_hours) {
+        const proactiveAfter = addHoursISO(opts.documentDate, fact.proactive_nudge.after_hours);
+        setProactiveAfter(factId, proactiveAfter);
+        console.log(`[extractor] nudge scheduled: fact_${factId} after ${fact.proactive_nudge.after_hours}h (${proactiveAfter})`);
+      }
 
       // Contradiction resolver — if the model flagged this as superseding an
       // existing fact, find it via FTS5 and write the versioning chain.

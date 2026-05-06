@@ -15,7 +15,10 @@
     "memory:viz": "tsx scripts/memory-viz.ts",
     "memory:rewire": "tsx scripts/rewire-memory-parents.ts",
     "memory:reset": "tsx scripts/reset-memory.ts",
-    "backfill-graph": "tsx scripts/backfill-graph.ts"
+    "proactive:log": "tsx scripts/proactive-log.ts",
+    "backfill-graph": "tsx scripts/backfill-graph.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
@@ -27,7 +30,8 @@
     "@types/node": "^25.6.0",
     "@types/node-cron": "^3.0.11",
     "tsx": "^4.21.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
   },
   "dependencies": {
     "@chroma-core/default-embed": "^0.1.9",

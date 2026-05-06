@@ -253,7 +253,12 @@ export function rewireChildren(oldParentId: number, newParentId: number): void {
  * delta should be 1 + child.descendant_count so the parent's count reflects the
  * full subtree size being added, not just the immediate child.
  * Multi-parent and cycle safe.
+ *
+ * For L1 facts: if the new count lands on a milestone (3, 5, 8, 12, 20),
+ * pattern_observation_queued is set to 1 atomically.
  */
+const PATTERN_MILESTONES = new Set([3, 5, 8, 12, 20]);
+
 export function propagateDescendantIncrement(parentId: number, delta = 1): void {
   const stack = [parentId];
   const visited = new Set<number>();
@@ -262,8 +267,22 @@ export function propagateDescendantIncrement(parentId: number, delta = 1): void 
     if (currentId === undefined || visited.has(currentId)) continue;
     visited.add(currentId);
     db()
-      .prepare("UPDATE memory_facts SET descendant_count = descendant_count + ? WHERE id = ?")
-      .run(delta, currentId);
+      .prepare(
+        `UPDATE memory_facts
+         SET descendant_count = descendant_count + ?,
+             pattern_observation_queued = CASE
+               WHEN COALESCE(abstraction_level, 1) = 1
+                    AND (descendant_count + ?) IN (3, 5, 8, 12, 20)
+               THEN 1
+               ELSE pattern_observation_queued
+             END
+         WHERE id = ?`,
+      )
+      .run(delta, delta, currentId);
+    const updated = getFactById(currentId);
+    if (updated && updated.abstraction_level === 1 && PATTERN_MILESTONES.has(updated.descendant_count)) {
+      console.log(`[facts] pattern milestone fact_${currentId}: descendant_count=${updated.descendant_count} → queued`);
+    }
     stack.push(...getInstanceOfParents(currentId));
   }
 }
@@ -383,6 +402,7 @@ export function getExpiredLevel0Facts(limit = 50): MemoryFact[] {
          AND is_latest = 1 AND is_forgotten = 0
          AND forget_after IS NOT NULL
          AND datetime(forget_after) < datetime('now')
+         AND (proactive_after IS NULL OR proactive_fired_at IS NOT NULL)
        ORDER BY forget_after ASC
        LIMIT ?`,
     )
@@ -586,12 +606,37 @@ export function searchFactsFTS(query: string, limit = 10): FTSHit[] {
 // Proactive log
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function logProactive(triggerType: string, content: string): void {
+export function logProactive(triggerType: string, content: string, sourceFactId?: number): void {
   db()
     .prepare(
-      "INSERT INTO proactive_log (user_id, trigger_type, content_sent) VALUES (?, ?, ?)",
+      "INSERT INTO proactive_log (user_id, trigger_type, content_sent, source_fact_id) VALUES (?, ?, ?, ?)",
     )
-    .run(config().USER_ID, triggerType, content);
+    .run(config().USER_ID, triggerType, content, sourceFactId ?? null);
+}
+
+export function logProactiveAttempt(attempt: {
+  trigger_type: string;
+  trigger?: string;
+  decision: "sent" | "skipped" | "blocked" | "error";
+  reason: string;
+  candidate?: string;
+  context_summary?: string;
+}): void {
+  db()
+    .prepare(
+      `INSERT INTO proactive_attempts
+         (user_id, trigger_type, trigger, decision, reason, candidate, context_summary)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      config().USER_ID,
+      attempt.trigger_type,
+      attempt.trigger ?? null,
+      attempt.decision,
+      attempt.reason,
+      attempt.candidate ?? null,
+      attempt.context_summary ?? null,
+    );
 }
 
 export function getLastProactiveSentAt(): Date | null {
@@ -601,4 +646,114 @@ export function getLastProactiveSentAt(): Date | null {
     )
     .get(config().USER_ID) as { sent_at: string } | undefined;
   return row ? new Date(row.sent_at) : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proactive: Type 1 — L0 Nudges
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** L0 facts whose proactive_after time has passed and haven't been fired yet. */
+export function getNudgeDueFacts(): Array<{ id: number; text: string; proactive_after: string }> {
+  return db()
+    .prepare(
+      `SELECT id, text, proactive_after FROM memory_facts
+       WHERE user_id = ?
+         AND proactive_after IS NOT NULL
+         AND proactive_fired_at IS NULL
+         AND proactive_after <= datetime('now')
+         AND is_latest = 1
+         AND is_forgotten = 0
+       ORDER BY proactive_after ASC`,
+    )
+    .all(config().USER_ID) as Array<{ id: number; text: string; proactive_after: string }>;
+}
+
+export function setProactiveAfter(factId: number, proactiveAfter: string): void {
+  db()
+    .prepare("UPDATE memory_facts SET proactive_after = ? WHERE id = ?")
+    .run(proactiveAfter, factId);
+}
+
+/** Mark a nudge fact as processed (regardless of whether the gate allowed sending). */
+export function markNudgeFired(factId: number): void {
+  db()
+    .prepare("UPDATE memory_facts SET proactive_fired_at = datetime('now') WHERE id = ?")
+    .run(factId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proactive: Type 2 — L1 Pattern Observation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** L1 facts that hit a descendant_count milestone and are queued for observation. */
+export function getQueuedPatternFacts(): MemoryFact[] {
+  return db()
+    .prepare(
+      `SELECT ${FACT_COLS} FROM memory_facts
+       WHERE user_id = ?
+         AND COALESCE(abstraction_level, 1) = 1
+         AND pattern_observation_queued = 1
+         AND is_latest = 1
+         AND is_forgotten = 0
+       ORDER BY COALESCE(descendant_count, 0) DESC`,
+    )
+    .all(config().USER_ID) as MemoryFact[];
+}
+
+/** Clear ALL pattern_observation_queued flags after one run (win or skip). */
+export function clearAllPatternObservationQueued(): void {
+  db()
+    .prepare(
+      "UPDATE memory_facts SET pattern_observation_queued = 0 WHERE user_id = ? AND pattern_observation_queued = 1",
+    )
+    .run(config().USER_ID);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proactive: Type 4 — Absence Reflection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Top L1 bedrock facts that Alfred hasn't proactively mentioned (via source_fact_id)
+ * in the last `lookbackDays` days. Used for absence reflection.
+ */
+export function getStaleBedrock(lookbackDays: number): MemoryFact[] {
+  return db()
+    .prepare(
+      `SELECT ${FACT_COLS}
+       FROM memory_facts mf
+       WHERE mf.user_id = ?
+         AND COALESCE(mf.abstraction_level, 1) = 1
+         AND mf.is_latest = 1
+         AND mf.is_forgotten = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM proactive_log pl
+           WHERE pl.source_fact_id = mf.id
+             AND pl.sent_at >= datetime('now', '-' || ? || ' days')
+         )
+       ORDER BY
+         CAST(COALESCE(mf.descendant_count, 0) AS REAL)
+           / (1.0 + (julianday('now') - julianday(mf.created_at)) * 0.05) DESC
+       LIMIT 5`,
+    )
+    .all(config().USER_ID, lookbackDays) as MemoryFact[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cron state — catch-up tracking
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function getCronLastRan(jobName: string): Date | null {
+  const row = db()
+    .prepare("SELECT last_ran_at FROM cron_state WHERE job_name = ?")
+    .get(jobName) as { last_ran_at: string } | undefined;
+  return row ? new Date(row.last_ran_at) : null;
+}
+
+export function setCronLastRan(jobName: string): void {
+  db()
+    .prepare(
+      "INSERT INTO cron_state(job_name, last_ran_at) VALUES(?, ?) ON CONFLICT(job_name) DO UPDATE SET last_ran_at = excluded.last_ran_at",
+    )
+    .run(jobName, new Date().toISOString());
 }

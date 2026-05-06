@@ -85,6 +85,21 @@ function applySchema(db: Database.Database): void {
       sent_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS proactive_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL DEFAULT 'local',
+      trigger_type TEXT NOT NULL,
+      trigger TEXT,
+      decision TEXT NOT NULL,      -- sent | skipped | blocked | error
+      reason TEXT NOT NULL,
+      candidate TEXT,
+      context_summary TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_proactive_attempts_created
+      ON proactive_attempts(user_id, created_at DESC);
+
     CREATE INDEX IF NOT EXISTS idx_fact_relations_a ON fact_relations(fact_id_a, relation_type);
     CREATE INDEX IF NOT EXISTS idx_fact_relations_b ON fact_relations(fact_id_b, relation_type);
 
@@ -156,5 +171,48 @@ function applySchema(db: Database.Database): void {
         ON memory_facts(user_id, abstraction_level, is_latest, is_forgotten);
     `);
     db.pragma("user_version = 3");
+  }
+
+  if (schemaVersion < 4) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS proactive_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL DEFAULT 'local',
+        trigger_type TEXT NOT NULL,
+        trigger TEXT,
+        decision TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        candidate TEXT,
+        context_summary TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_proactive_attempts_created
+        ON proactive_attempts(user_id, created_at DESC);
+    `);
+    db.pragma("user_version = 4");
+  }
+
+  if (schemaVersion < 5) {
+    db.exec(`
+      ALTER TABLE memory_facts ADD COLUMN proactive_after TEXT;
+      ALTER TABLE memory_facts ADD COLUMN proactive_fired_at TEXT;
+      ALTER TABLE memory_facts ADD COLUMN pattern_observation_queued INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE proactive_log ADD COLUMN source_fact_id INTEGER REFERENCES memory_facts(id);
+      CREATE INDEX IF NOT EXISTS idx_facts_nudge
+        ON memory_facts(user_id, proactive_after, proactive_fired_at)
+        WHERE proactive_after IS NOT NULL;
+    `);
+    db.pragma("user_version = 5");
+  }
+
+  if (schemaVersion < 6) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cron_state (
+        job_name TEXT PRIMARY KEY,
+        last_ran_at TEXT NOT NULL
+      );
+    `);
+    db.pragma("user_version = 6");
   }
 }

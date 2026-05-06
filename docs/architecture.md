@@ -139,19 +139,24 @@ See [memory.md](./memory.md) for the full knowledge graph architecture.
 
 | Trigger | Schedule | What |
 |---|---|---|
-| Reminder cron | Every minute | Fires any reminders past their `due_at` |
+| Reminder + nudge cron | Every minute | Strictly-due reminders (bypass gate) + L0 nudges + catch-up check |
 | Morning brief | 9:00am | Today's Todoist tasks + upcoming events from memory |
-| Midday pulse | 1:00pm | Heads up if something happening in next 48h |
+| External synthesis | 1:00pm | Web-searched news/content relevant to user's identity (Type 3) |
+| Absence reflection | 5:00pm | Check-in on stale bedrock patterns (Type 4) |
 | Evening wrap | 7:00pm | Check open/overdue Todoist tasks |
 | L0 consolidation | Every 6h | Expire L0 facts, cluster into L1 patterns |
+| L1 pattern observation | Every 6h | Milestone-triggered pattern messages (Type 2) |
 | L1→L2 promotion | Weekly (Sunday 3:30am) | Promote supported patterns to identity/values |
 
-**Gate checks before every proactive send:**
+**Gate checks before every non-reminder proactive send:**
 1. Within quiet hours? → skip
 2. Proactive message sent in last 3 hours? → skip (spam prevention)
-3. LLM returns `SKIP`? → skip
+3. Types 2/3/4: LLM judge score < 70? → skip
+4. Types 1/brief/wrap: LLM returns `SKIP`? → skip
 
-Proactive messages have tools enabled — the morning brief and evening wrap use `todoist_list_tasks` to get real data, not cached context.
+**Catch-up:** The per-minute tick also runs `checkMissedCrons`, which recovers daily and 6-hourly jobs missed while the Mac was asleep. Daily jobs have a 4-hour catch-up window; 6-hourly jobs catch up whenever 6+ hours have elapsed. See [proactive.md](./proactive.md) for full details.
+
+Proactive messages have tools enabled — morning brief and evening wrap use `todoist_list_tasks` to get real data, not cached context.
 
 ---
 
