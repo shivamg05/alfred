@@ -24,6 +24,7 @@ vi.mock("../src/orchestrator/llm.js", () => ({
 vi.mock("../src/orchestrator/context.js", () => ({
   fetchContext: vi.fn().mockResolvedValue({
     memoryContext: { identity: [], bedrock: [], retrieved: [] },
+    sessionSummary: null,
     todoistTasks: null,
   }),
   buildPrompt: vi.fn().mockReturnValue("system prompt"),

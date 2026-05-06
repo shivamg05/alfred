@@ -109,6 +109,28 @@ async function main(): Promise<void> {
   );
   console.log("[alfred] buffer seeded with", recent.length, "messages");
 
+  // Register session summarizer — compresses older messages when buffer exceeds injection cap
+  const { llmClient } = await import("./orchestrator/llm.js");
+  buffer.onNeedsSummary(async (msgs) => {
+    const transcript = msgs
+      .map((m) => `[${m.role === "user" ? "user" : "alfred"}]: ${m.content}`)
+      .join("\n");
+    const response = await llmClient().chat.completions.create({
+      model: "google/gemini-2.5-flash-lite",
+      messages: [
+        {
+          role: "system",
+          content:
+            "Summarize this conversation excerpt in 2-3 sentences. Focus on: topics discussed, any decisions or plans made, emotional tone, and open threads that might come up again. Be concise — this will be injected as context for an ongoing conversation. Do not use bullet points.",
+        },
+        { role: "user", content: transcript },
+      ],
+      max_tokens: 150,
+      temperature: 0,
+    });
+    return response.choices[0]?.message?.content?.trim() ?? "";
+  });
+
   // Embed any facts that were saved without embeddings (ChromaDB was down during extraction)
   embedUnindexedFacts().catch((err) =>
     console.error("[alfred] startup embed failed:", err),

@@ -8,6 +8,7 @@ export function buildSystemPrompt(
   recentMessages: BufferMessage[],
   todoistTasks = "",
   mode: ResponseMode = "full",
+  sessionSummary: string | null = null,
 ): string {
   const tz = config().USER_TIMEZONE;
   const now = new Date().toLocaleString("en-US", {
@@ -35,9 +36,13 @@ export function buildSystemPrompt(
       ? context.retrieved.map((f) => `- ${f}`).join("\n")
       : null;
 
+  const summaryBlock = sessionSummary
+    ? `[earlier in this conversation: ${sessionSummary}]\n\n`
+    : "";
+
   const history =
     recentMessages.length > 0
-      ? recentMessages
+      ? summaryBlock + recentMessages
           .map((m) => `[${m.role === "user" ? "user" : "alfred"}]: ${m.content}`)
           .join("\n")
       : "(start of conversation)";

@@ -194,6 +194,34 @@ describe("conversation history", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────
+// Session summary
+// ────────────────────────────────────────────────────────────────────
+
+describe("session summary", () => {
+  it("includes summary when provided", () => {
+    const msgs = makeMessages(["user", "so what do you think"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", "They discussed work stress and a plan to take Friday off");
+    expect(prompt).toContain("earlier in this conversation");
+    expect(prompt).toContain("discussed work stress");
+    expect(prompt).toContain("take Friday off");
+  });
+
+  it("omits summary block when null", () => {
+    const msgs = makeMessages(["user", "hey"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", null);
+    expect(prompt).not.toContain("earlier in this conversation");
+  });
+
+  it("summary appears before recent messages", () => {
+    const msgs = makeMessages(["user", "continue"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", "Old context here");
+    const summaryIdx = prompt.indexOf("earlier in this conversation");
+    const msgIdx = prompt.indexOf("[user]: continue");
+    expect(summaryIdx).toBeLessThan(msgIdx);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
 // Todoist section
 // ────────────────────────────────────────────────────────────────────
 
