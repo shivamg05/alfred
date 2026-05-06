@@ -1,4 +1,4 @@
-# Alfred — Codebase Guide for Claude
+# Alfred — Codebase Guide for Codex
 
 ## What this is
 
@@ -100,7 +100,7 @@ All LLM calls go through the OpenAI SDK pointed at `LLM_BASE_URL`. Currently: Op
 - **Proactive**: `generateProactive()` in `orchestrator/llm.ts` — `LLM_MODEL`, max 150 tokens
 - **Embeddings**: `vectors.ts` — routes through `LLM_BASE_URL`, model `openai/text-embedding-3-small`
 - **Transcription**: `transcribeAudio()` — `google/gemini-2.5-flash-lite` via OpenRouter, base64 WAV via `input_audio`; audio converted from CAF using macOS `afconvert`
-- **Image**: `summarizeImageFromPath()` — vision model via OpenRouter (`anthropic/claude-haiku-4-5`); HEIC converted to JPEG via `heic-convert`; supports multiple images in parallel
+- **Image**: `summarizeImageFromPath()` — vision model via OpenRouter (`anthropic/Codex-haiku-4-5`); HEIC converted to JPEG via `heic-convert`; supports multiple images in parallel
 
 ## Response flow
 

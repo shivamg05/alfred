@@ -18,17 +18,17 @@ function extractJSON(s: string): string {
 
 const PROMPT = `Decide how Alfred should respond to this iMessage. Return ONLY raw JSON: { "mode": "silent" | "acknowledge" | "brief" | "full" }
 
-silent — pure reaction, throwaway text, or nothing to confirm or engage with.
-  → "lol", "fr", "damn", "ok", "ya true", "deadass", "bet", "💀", "that was crazy"
+silent: pure reaction, throwaway text, or nothing to confirm or engage with, or if the message feels as if it will be followed by another (is an incomplete thought); applies when it would be appropriate for someone to politely smile in response.
+  → "lol", "fr", "ok", "ya thats true", "deadass", "bet", "💀", "that was crazy"
 
-acknowledge — explicit command to record/note/do something, or the user clearly only wants receipt confirmation.
-  → "remind me to call mom tomorrow" / "note that i have a meeting at 3" / "i don't wanna talk about it" / "just fyi i'm heading out"
+acknowledge: explicit command to record/note/do something, or the user clearly only wants receipt confirmation; applies when it would be appropriate for someone to nod in response.
+  → "remind me to call mom tomorrow" / "note that i have a meeting at 3" / "i don't wanna talk about it" / "just fyi i'm heading out" / "just got back from the gym"
   NOT acknowledge: venting, sharing news, updates about their life, anything that opens a topic
 
-brief — sharing something, venting, starting a topic, emotionally addressing Alfred, or updating Alfred on their life. Invites a natural reaction or follow-up, but does not need tools.
-  → "work has been crazy" / "kinda nervous about tomorrow" / "just finished the project" / "my summer is split into 3 tracks" / "i'm so tired of this" / "just got back from the gym"
+brief: sharing something, venting, starting a topic, emotionally addressing Alfred, or updating Alfred on their life. Invites a natural reaction or follow-up, but does not need tools.
+  → "work has been crazy" / "kinda nervous about tomorrow" / "just finished the project" / "my summer is split into 3 tracks" / "i'm so tired of this" / "i should probably go to the gym..."
 
-full — explicit question, request, or asking Alfred to do/look up/check something.
+full: explicit question, request, or asking Alfred to do/look up/check something.
   → "what do you think about X?" / "help me plan Y" / "should I do A or B?" / "can you look up Z?" / "where am I?" / "tell me X" / "find me X"
 
 When the conversation context shows a prior question or request, treat follow-ups as full.

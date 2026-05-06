@@ -10,9 +10,9 @@ import { fileURLToPath } from "url";
 import { dirname, resolve } from "path";
 loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
-import Database from "better-sqlite3";
 import { ChromaClient } from "chromadb";
 import { config } from "../src/config.js";
+import { db as openDB } from "../src/db/schema.js";
 
 if (!process.argv.includes("--yes")) {
   console.error("Refusing to reset memory without --yes");
@@ -21,7 +21,8 @@ if (!process.argv.includes("--yes")) {
 }
 
 const cfg = config();
-const db = new Database(cfg.DB_PATH);
+// openDB() runs applySchema() and all migrations before we touch any table
+const db = openDB();
 const includeMessages = process.argv.includes("--include-messages");
 
 db.pragma("foreign_keys = OFF");
@@ -33,16 +34,16 @@ db.transaction(() => {
   db.prepare("DELETE FROM user_profile").run();
   db.prepare("DELETE FROM reminders").run();
   db.prepare("DELETE FROM proactive_log").run();
+  db.prepare("DELETE FROM proactive_attempts").run();
+  db.prepare("DELETE FROM cron_state").run();
   if (includeMessages) db.prepare("DELETE FROM messages").run();
   db.prepare(
     `DELETE FROM sqlite_sequence
-     WHERE name IN ('memory_facts', 'fact_relations', 'user_profile', 'reminders', 'proactive_log'
+     WHERE name IN ('memory_facts', 'fact_relations', 'user_profile', 'reminders', 'proactive_log', 'proactive_attempts'
        ${includeMessages ? ", 'messages'" : ""})`,
   ).run();
 })();
 db.pragma("foreign_keys = ON");
-
-db.close();
 console.log(`[reset-memory] cleared SQLite memory tables${includeMessages ? " and raw message history" : ""}`);
 
 try {

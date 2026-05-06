@@ -115,7 +115,7 @@ async function main(): Promise<void> {
   );
 
   // Register proactive cron jobs
-  registerCronJobs(sdk);
+  registerCronJobs(sdk, buffer);
   console.log("[alfred] cron jobs registered");
 
   // --- Response debounce state (per-process, single user) ---
