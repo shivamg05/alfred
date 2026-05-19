@@ -5,3 +5,4 @@ dist/
 chroma_data/
 *.mp3
 *.caf
+.prompt-log.json

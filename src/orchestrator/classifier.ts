@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { config } from "../config.js";
 import { llmClient } from "./llm.js";
+import { logPrompt } from "../debug/promptLog.js";
 
 export type ResponseMode = "silent" | "acknowledge" | "brief" | "full";
 
@@ -69,6 +70,8 @@ export async function generateContextualAck(
     const contextBlock = recentMessages.length > 0
       ? `\nRECENT CONVERSATION:\n${recentMessages.slice(-4).map((m) => `[${m.role === "assistant" ? "alfred" : "user"}]: ${m.content}`).join("\n")}\n`
       : "";
+    logPrompt("ack", ACK_PROMPT + contextBlock, { userMessage });
+
     const response = await llmClient().chat.completions.create({
       model: "google/gemini-2.5-flash-lite",
       messages: [
@@ -100,10 +103,16 @@ export async function classifyIntent(
     : "";
 
   try {
+    const classifierSystem = PROMPT + contextBlock;
+    logPrompt("classifier", classifierSystem, {
+      userMessage,
+      meta: { model: "google/gemini-2.5-flash-lite", tailSize: String(tail.length) },
+    });
+
     const response = await llmClient().chat.completions.create({
       model: "google/gemini-2.5-flash-lite",
       messages: [
-        { role: "system", content: PROMPT + contextBlock },
+        { role: "system", content: classifierSystem },
         { role: "user", content: userMessage },
       ],
       max_tokens: 60,

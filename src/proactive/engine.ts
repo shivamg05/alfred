@@ -95,6 +95,12 @@ async function runProactiveChat(
   const contextSummary = summarizeContext(contextData, wantsTodoist);
   const systemPrompt = buildPrompt(contextData, "full") + PROACTIVE_SUFFIX;
 
+  const { logPrompt } = await import("../debug/promptLog.js");
+  logPrompt("proactive", systemPrompt, {
+    userMessage: trigger,
+    meta: { logType, context: contextSummary },
+  });
+
   let msg: string;
   try {
     msg = await chat(systemPrompt, `[internal: ${trigger}]`, { allowTools: true });

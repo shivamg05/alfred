@@ -16,6 +16,7 @@
     "memory:rewire": "tsx scripts/rewire-memory-parents.ts",
     "memory:reset": "tsx scripts/reset-memory.ts",
     "proactive:log": "tsx scripts/proactive-log.ts",
+    "prompts": "tsx scripts/show-prompts.ts",
     "backfill-graph": "tsx scripts/backfill-graph.ts",
     "test": "vitest run",
     "test:watch": "vitest"

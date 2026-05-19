@@ -325,10 +325,17 @@ export async function extractFromMessage(opts: {
 
   let raw: string;
   try {
+    const extractionSystemPrompt = buildExtractionPrompt(opts.documentDate, existingFacts, cfg.USER_TIMEZONE);
+    const { logPrompt } = await import("../debug/promptLog.js");
+    logPrompt("extraction", extractionSystemPrompt, {
+      userMessage: opts.messageText.slice(0, 200),
+      meta: { model: cfg.EXTRACTION_MODEL, existingFactCount: String(existingFacts.length) },
+    });
+
     const response = await llm().chat.completions.create({
       model: cfg.EXTRACTION_MODEL,
       messages: [
-        { role: "system", content: buildExtractionPrompt(opts.documentDate, existingFacts, cfg.USER_TIMEZONE) },
+        { role: "system", content: extractionSystemPrompt },
         { role: "user", content: opts.messageText },
       ],
       max_tokens: 1500,

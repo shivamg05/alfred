@@ -222,6 +222,51 @@ describe("session summary", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────
+// Decision log
+// ────────────────────────────────────────────────────────────────────
+
+describe("decision log", () => {
+  it("includes decision log when provided", () => {
+    const msgs = makeMessages(["user", "so saturday?"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", null, "Discussing weekend plans. Considering hiking Saturday.");
+    expect(prompt).toContain("SESSION STATE");
+    expect(prompt).toContain("Discussing weekend plans");
+    expect(prompt).toContain("hiking Saturday");
+  });
+
+  it("omits decision log when null", () => {
+    const msgs = makeMessages(["user", "hey"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", null, null);
+    expect(prompt).not.toContain("SESSION STATE");
+  });
+
+  it("decision log appears before RECENT CONVERSATION", () => {
+    const msgs = makeMessages(["user", "what time?"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", null, "Planning a meetup.");
+    const logIdx = prompt.indexOf("SESSION STATE");
+    const convIdx = prompt.indexOf("RECENT CONVERSATION");
+    expect(logIdx).toBeLessThan(convIdx);
+  });
+
+  it("decision log appears after memory sections", () => {
+    const ctx = makeContext({ identity: ["User is a student"] });
+    const msgs = makeMessages(["user", "test"]);
+    const prompt = buildSystemPrompt(ctx, msgs, "", "full", null, "Some session state.");
+    const memIdx = prompt.indexOf("CORE IDENTITY");
+    const logIdx = prompt.indexOf("SESSION STATE");
+    expect(memIdx).toBeLessThan(logIdx);
+  });
+
+  it("both session summary and decision log can coexist", () => {
+    const msgs = makeMessages(["user", "continue"]);
+    const prompt = buildSystemPrompt(makeContext(), msgs, "", "full", "Earlier they talked about X.", "Active topic: Y. User seems tired.");
+    expect(prompt).toContain("earlier in this conversation");
+    expect(prompt).toContain("SESSION STATE");
+    expect(prompt).toContain("Active topic: Y");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
 // Todoist section
 // ────────────────────────────────────────────────────────────────────
 

@@ -109,23 +109,72 @@ async function main(): Promise<void> {
   );
   console.log("[alfred] buffer seeded with", recent.length, "messages");
 
-  // Register session summarizer — compresses older messages when buffer exceeds injection cap
+  // Register rolling session summarizer — folds evicted messages into a running summary
+  // so conversation context survives beyond the 20-message buffer window.
   const { llmClient } = await import("./orchestrator/llm.js");
-  buffer.onNeedsSummary(async (msgs) => {
-    const transcript = msgs
+  const { logPrompt } = await import("./debug/promptLog.js");
+  buffer.onNeedsSummary(async (existingSummary, evictedMsgs) => {
+    const newMessages = evictedMsgs
       .map((m) => `[${m.role === "user" ? "user" : "alfred"}]: ${m.content}`)
       .join("\n");
+    const existingBlock = existingSummary
+      ? `EXISTING SUMMARY (of even older messages):\n${existingSummary}\n\n`
+      : "";
+    const summarySystemPrompt = `You maintain a rolling conversation summary. Fold the new messages into the existing summary to produce an updated version.
+
+${existingBlock}NEW MESSAGES TO FOLD IN:
+${newMessages}
+
+Write an updated summary in 2-4 sentences. Keep what's still relevant from the existing summary, incorporate the new messages, and drop anything that's been resolved or is no longer important. Focus on: topics discussed, decisions made, emotional tone, and open threads. No bullet points.`;
+    logPrompt("session_summary", summarySystemPrompt, {
+      meta: { evictedCount: String(evictedMsgs.length), hasExisting: String(!!existingSummary) },
+    });
+
     const response = await llmClient().chat.completions.create({
       model: "google/gemini-2.5-flash-lite",
       messages: [
-        {
-          role: "system",
-          content:
-            "Summarize this conversation excerpt in 2-3 sentences. Focus on: topics discussed, any decisions or plans made, emotional tone, and open threads that might come up again. Be concise — this will be injected as context for an ongoing conversation. Do not use bullet points.",
-        },
-        { role: "user", content: transcript },
+        { role: "system", content: summarySystemPrompt },
+        { role: "user", content: "Update the rolling summary." },
       ],
-      max_tokens: 150,
+      max_tokens: 200,
+      temperature: 0,
+    });
+    return response.choices[0]?.message?.content?.trim() ?? "";
+  });
+
+  // Register decision log updater — generates rolling session state after each Alfred reply
+  buffer.onUpdateDecisionLog(async (currentLog, lastUser, lastAssistant) => {
+    const existing = currentLog
+      ? `CURRENT LOG:\n${currentLog}\n\n`
+      : "";
+    const decisionLogPrompt = `You maintain a rolling state log for an ongoing iMessage conversation between a user and their AI friend Alfred. After each exchange, update the log to reflect the current session state.
+
+${existing}LATEST EXCHANGE:
+[user]: ${lastUser}
+[alfred]: ${lastAssistant}
+
+Write an updated session state log. Include ONLY what's relevant right now:
+- active topic(s) being discussed
+- decisions or plans made this session
+- questions asked but not yet answered (by either side)
+- user's current mood/energy if apparent
+- anything Alfred should remember to follow up on
+
+Keep it to 3-5 short lines. Drop anything from the previous log that's been resolved or is no longer relevant. No bullet points, use plain short sentences.
+
+EXAMPLE OUTPUT: Discussing weekend plans: user wants to do something active. Decided on hiking Saturday. User asked about trail recommendations, still waiting for Alfred to look it up. User seems upbeat and excited about getting outside.`;
+    logPrompt("decision_log", decisionLogPrompt, {
+      userMessage: lastUser.slice(0, 200),
+      meta: { hasExisting: String(!!currentLog) },
+    });
+
+    const response = await llmClient().chat.completions.create({
+      model: "google/gemini-2.5-flash-lite",
+      messages: [
+        { role: "system", content: decisionLogPrompt },
+        { role: "user", content: "Update the session state log." },
+      ],
+      max_tokens: 200,
       temperature: 0,
     });
     return response.choices[0]?.message?.content?.trim() ?? "";
@@ -206,11 +255,15 @@ async function main(): Promise<void> {
       console.log(`[alfred] timings — classify+context:${tContext - t0}ms llm:${tLLM - tContext}ms send:${tSend - tLLM}ms total:${tSend - t0}ms wall:${tSend - wallStart}ms`);
       console.log(`[alfred] reply (${mode}): ${reply}`);
 
+      const cleanReply = reply.replace(/\[SPLIT\]/g, " ");
       buffer.push({
         role: "assistant",
-        content: reply.replace(/\[SPLIT\]/g, " "),
+        content: cleanReply,
         timestamp: new Date().toISOString(),
       });
+
+      // Fire decision log update asynchronously — ready before next message
+      buffer.updateDecisionLog(combinedText, cleanReply);
     } catch (err) {
       console.error("[alfred] response error:", err);
     }

@@ -4,6 +4,7 @@ import { buildSystemPrompt } from "../tone/systemPrompt.js";
 import { getTasks, formatTasksForContext } from "../integrations/todoist.js";
 import { config } from "../config.js";
 import { ResponseMode } from "./classifier.js";
+import { logPrompt } from "../debug/promptLog.js";
 
 let _cachedTasksStr: string = "none";
 let _lastTaskFetch = 0;
@@ -24,6 +25,7 @@ export interface ContextData {
   memoryContext: Awaited<ReturnType<typeof retrieveContext>>;
   recentMessages: ReturnType<ConversationBuffer["getForPrompt"]>;
   sessionSummary: string | null;
+  decisionLog: string | null;
   todoistTasks: string;
 }
 
@@ -39,6 +41,7 @@ export async function fetchContext(
   // Use capped prompt window (last 12) — older messages are in sessionSummary
   const recentMessages = buffer.getForPrompt();
   const sessionSummary = buffer.sessionSummary;
+  const decisionLog = buffer.decisionLog;
   const latestUserMsg =
     recentMessages.filter((m) => m.role === "user").at(-1)?.content ?? "";
 
@@ -47,7 +50,7 @@ export async function fetchContext(
     opts.includeTodoist ? getTaskContext() : Promise.resolve(""),
   ]);
 
-  return { memoryContext, recentMessages, sessionSummary, todoistTasks };
+  return { memoryContext, recentMessages, sessionSummary, decisionLog, todoistTasks };
 }
 
 /** Assembles the final system prompt once mode is known. */
@@ -55,11 +58,17 @@ export function buildPrompt(data: ContextData, mode: ResponseMode): string {
   console.log(
     `[context] mode=${mode} history=${data.recentMessages.length}msgs ` +
     `summary=${data.sessionSummary ? `${data.sessionSummary.length}ch` : "none"} ` +
+    `log=${data.decisionLog ? `${data.decisionLog.length}ch` : "none"} ` +
     `identity=${data.memoryContext.identity.length} bedrock=${data.memoryContext.bedrock.length} ` +
     `retrieved=${data.memoryContext.retrieved.length} ` +
     `todoist=${data.todoistTasks ? "yes" : "no"}`,
   );
-  return buildSystemPrompt(data.memoryContext, data.recentMessages, data.todoistTasks, mode, data.sessionSummary);
+  const prompt = buildSystemPrompt(data.memoryContext, data.recentMessages, data.todoistTasks, mode, data.sessionSummary, data.decisionLog);
+  logPrompt("system", prompt, {
+    userMessage: data.recentMessages.filter((m) => m.role === "user").at(-1)?.content,
+    meta: { mode },
+  });
+  return prompt;
 }
 
 /** Convenience wrapper (keeps existing callers working). */
